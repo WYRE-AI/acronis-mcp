@@ -15,16 +15,23 @@ on:
 jobs:
   release:
     permissions:
+      actions: read # Security Scan: SARIF upload reads run metadata on a private repo
       contents: write
       issues: write
       pull-requests: write # @semantic-release/github success step reads/comments on PRs
       packages: write
       id-token: write
       security-events: write
-    uses: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-release.yml@2b0b056bd7544937e5cbd56cf2e1ff8a180a411f
+    # Pinned to WYRE-AI/reusable-workflows#3 (private-repo-safe Security Scan and
+    # MCP Registry publish). Repin to that PR's merge commit once it lands.
+    uses: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-release.yml@b1bf1ba5bc31ac31725fb5d2961b887eedde860f
     with:
       server-name: acronis-mcp
       image-name: ghcr.io/wyre-ai/acronis-mcp
+      # This repo is private: the reusable skips the public MCP Registry
+      # publish and skips the SARIF upload while Code Security is off. The
+      # Trivy scan still runs and fails the job on these severities.
+      fail-on-severity: HIGH,CRITICAL
     secrets: inherit
 
 # NO `deploy:` job — deliberate, matching the connectwise-cpq-mcp precedent.
