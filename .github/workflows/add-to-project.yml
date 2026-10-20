@@ -1,0 +1,12 @@
+name: Auto-add to project
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+
+jobs:
+  call:
+    uses: wyre-technology/.github/.github/workflows/auto-add-to-project.yml@692c0d01979dfe2a2738d71dbf20a3b47a3bb014  # pinned (warden C-4) — bump via PR not in-place edit
+    secrets: inherit

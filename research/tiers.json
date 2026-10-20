@@ -1,0 +1,43 @@
+{
+ "read": [
+  "fetch_tenant",
+  "fetch_tenants_batch",
+  "fetch_tenant_children",
+  "fetch_tenant_users",
+  "fetch_users_batch",
+  "fetch_user",
+  "fetch_current_user_info",
+  "search",
+  "fetch_tenant_mfastatus",
+  "fetch_tenant_usages",
+  "fetch_all_alerts",
+  "fetch_an_alert_by_id",
+  "fetch_categories",
+  "fetch_alert_counters",
+  "fetch_alerts_grouped_by_scope",
+  "fetch_all_alert_types",
+  "fetch_resources_containing_the_highest_severity_alerts",
+  "fetch_partner_s_customer_alerts_count",
+  "fetch_alerts_grouped_per_customer",
+  "get_count_of_active_alerts_and_last_modification_time",
+  "fetch_a_list_of_policies",
+  "fetch_a_policy",
+  "fetch_a_list_of_policy_applications",
+  "fetch_applications_issue_statistics",
+  "fetch_application_statuses_by_policy",
+  "fetch_a_list_of_all_resources",
+  "fetch_a_count_of_all_resources_that_match_filter_parameters",
+  "fetch_a_resource_by_id",
+  "fetch_the_protection_status_of_resources",
+  "fetch_agents",
+  "fetch_agent",
+  "fetch_incidents",
+  "fetch_incident",
+  "fetch_response_action_status"
+ ],
+ "write": [
+  "mark_alert_as_false_positive",
+  "update_investigation_state",
+  "execute_a_protection_policy"
+ ]
+}

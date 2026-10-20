@@ -1,0 +1,11 @@
+# Keep local secrets and build output out of the Docker build context.
+.env
+.env.*
+*.env
+.npmrc
+.git
+node_modules
+dist
+coverage
+research
+*.log

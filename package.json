@@ -1,0 +1,56 @@
+{
+  "name": "@wyre-ai/acronis-mcp",
+  "version": "0.0.0-semantically-released",
+  "description": "WYRE-AI hosted wrapper around the Acronis Cyber Protect Cloud MCP server (@acronis-platform/mcp, pinned)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "acronis-mcp": "./dist/entry.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "node scripts/smoke-dual-era.mjs",
+    "gen-tools": "node scripts/gen-tools.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WYRE-AI/acronis-mcp.git"
+  },
+  "author": "WYRE Technology",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@acronis-platform/mcp": "1.0.1",
+    "@modelcontextprotocol/client": "^2.1.0",
+    "@modelcontextprotocol/node": "^2.1.0",
+    "@modelcontextprotocol/server": "^2.0.0-beta.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@semantic-release/changelog": "^7.0.0",
+    "@semantic-release/github": "^12.0.10",
+    "@semantic-release/npm": "^13.2.0",
+    "@types/node": "^26.6.2",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0",
+    "semantic-release": "^25.0.0",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^5.0.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
