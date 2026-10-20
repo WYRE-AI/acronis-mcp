@@ -1,0 +1,70 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.WYRE-AI/acronis-mcp",
+  "title": "Acronis Cyber Protect Cloud",
+  "description": "Hosted WYRE-AI wrapper around the Acronis MCP server (@acronis-platform/mcp 1.0.1): alerts, policies, resources, agents, tenants, EDR incidents.",
+  "repository": {
+    "url": "https://github.com/WYRE-AI/acronis-mcp",
+    "source": "github"
+  },
+  "version": "0.0.0",
+  "websiteUrl": "https://github.com/WYRE-AI/acronis-mcp",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/wyre-ai/acronis-mcp:0.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ACRONIS_BASE_URL",
+          "description": "Acronis datacenter URL, https only, hostname must end with .acronis.com (e.g. https://us5-cloud.acronis.com)",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "ACRONIS_CLIENT_ID",
+          "description": "Acronis API client ID (OAuth client_credentials)",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "ACRONIS_CLIENT_SECRET",
+          "description": "Acronis API client secret",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "ACRONIS_ENABLE_WRITES",
+          "description": "Set to 'true' to expose the 3 write tools (default: read-only)",
+          "isRequired": false,
+          "default": "false",
+          "format": "string"
+        },
+        {
+          "name": "MCP_TRANSPORT",
+          "description": "Transport mode. Set to 'stdio' for local CLI use; the image defaults to 'http' for gateway hosting.",
+          "isRequired": false,
+          "default": "stdio",
+          "format": "string"
+        },
+        {
+          "name": "AUTH_MODE",
+          "description": "Credential source: 'env' reads vars locally, 'gateway' expects header injection from the WYRE MCP Gateway.",
+          "isRequired": false,
+          "default": "env",
+          "format": "string"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "description": "Log verbosity: debug, info, warn, error",
+          "isRequired": false,
+          "default": "info",
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

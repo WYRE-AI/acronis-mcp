@@ -1,0 +1,14 @@
+name: mcp-assert
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  assert:
+    uses: wyre-technology/.github/.github/workflows/mcp-assert.yml@7542c27000cf8d213c4910b4f397637b105a718b  # main
+    with:
+      entry: dist/index.js
+      canary-tool: acronis_fetch_all_alerts

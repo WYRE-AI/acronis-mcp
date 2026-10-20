@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Thin caller for the canonical reusable release pipeline. The build →
+# semantic-release → Docker → MCP Registry → security chain (tag-based release
+# detection + correct gating) lives in the public WYRE-AI/reusable-workflows repo so every *-mcp
+# repo stays in lockstep instead of drifting per-repo. Caller jobs grant the
+# token scopes the reusable jobs request (a reusable can only reduce, never
+# expand, caller-granted scope).
+jobs:
+  release:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write # @semantic-release/github success step reads/comments on PRs
+      packages: write
+      id-token: write
+      security-events: write
+    uses: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-release.yml@2b0b056bd7544937e5cbd56cf2e1ff8a180a411f
+    with:
+      server-name: acronis-mcp
+      image-name: ghcr.io/wyre-ai/acronis-mcp
+    secrets: inherit
+
+# NO `deploy:` job — deliberate, matching the connectwise-cpq-mcp precedent.
+#
+# The fleet-standard `mcp-server-deploy.yml` deploys to `gwp-<slug>` in the
+# `mcp-gateway-prod` resource group — the separate legacy fleet — NOT conduit.
+# No `gwp-acronis` Container App and no federated identity credential for this
+# repo exist yet, so that job would only fail (AADSTS7002131). Conduit's own
+# sidecars are deployed separately from `azure/vendor-fleet.conduit-prod.bicepparam`
+# by conduit's `deploy-vendor-fleet.yml` — see the mcp-vendor-scaffolding skill
+# §3.3. Add a `deploy:` job here only after that infra exists for this repo.
