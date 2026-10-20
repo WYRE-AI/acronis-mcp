@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  PoolBusyError,
   UpstreamPool,
   buildChildEnv,
   credentialKey,
@@ -118,19 +119,67 @@ describe("UpstreamPool", () => {
     await pool.close();
   });
 
-  it("does not close an in-use child that was evicted until the call ends", async () => {
+  it("never evicts a busy child: a new credential waits for a free slot", async () => {
     const { spawner, spawned } = fakeSpawner();
     const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
     let release!: () => void;
     const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
     await new Promise((r) => setTimeout(r, 0));
-    await use(pool, B);
-    expect(spawned[0].closed).toBe(false);
+    const waitingB = use(pool, B);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spawned).toHaveLength(1); // B has not displaced the busy A child
+    expect(pool.keys()).toEqual([credentialKey(A)]);
     release();
     await held;
-    await new Promise((r) => setTimeout(r, 0));
-    expect(spawned[0].closed).toBe(true);
+    await waitingB;
+    expect(spawned).toHaveLength(2);
+    expect(spawned[0].closed).toBe(true); // A was idle, so it made room for B
+    expect(pool.keys()).toEqual([credentialKey(B)]);
     await pool.close();
+  });
+
+  it("reuses the busy child for the same credential instead of spawning a second one (A, B, A with max 1)", async () => {
+    const { spawner, spawned } = fakeSpawner();
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+    let release!: () => void;
+    const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
+    await new Promise((r) => setTimeout(r, 0));
+    const waitingB = use(pool, B);
+    await use(pool, A); // served by the existing A child while B waits
+    expect(spawned).toHaveLength(1);
+    release();
+    await held;
+    await waitingB;
+    expect(spawned).toHaveLength(2);
+    expect(spawned.filter((s) => s.creds.clientId === "a")).toHaveLength(1);
+    await pool.close();
+  });
+
+  it("fails with PoolBusyError when no slot frees up within waitMs", async () => {
+    const { spawner, spawned } = fakeSpawner();
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, waitMs: 20 });
+    let release!: () => void;
+    const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
+    await new Promise((r) => setTimeout(r, 0));
+    await expect(use(pool, B)).rejects.toBeInstanceOf(PoolBusyError);
+    expect(spawned).toHaveLength(1);
+    release();
+    await held;
+    await pool.close();
+  });
+
+  it("close() also closes a retired child that is still serving a call", async () => {
+    const { spawner, spawned } = fakeSpawner();
+    const pool = new UpstreamPool({ toolsInclude: [], spawner });
+    let release!: () => void;
+    const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
+    await new Promise((r) => setTimeout(r, 0));
+    spawned[0].onClose(); // child reported exit while busy: retired but still in use
+    expect(pool.size).toBe(0);
+    await pool.close();
+    expect(spawned[0].closed).toBe(true);
+    release();
+    await held;
   });
 
   it("drops an entry when the child exits and respawns on next use", async () => {

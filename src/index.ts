@@ -162,7 +162,7 @@ export async function startHttpTransport(): Promise<HttpServer> {
     onerror: (error) => logger.error("MCP request adapter error", { error: error.message }),
   });
 
-  const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const handleHttp = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     // CORS for claude.ai custom connectors — set on every response, before routing.
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
@@ -174,7 +174,16 @@ export async function startHttpTransport(): Promise<HttpServer> {
       return;
     }
 
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    // Constant base: only the path is used, and a client-supplied Host header
+    // must never be able to make URL parsing throw.
+    let url: URL;
+    try {
+      url = new URL(req.url || "/", "http://localhost");
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad request" }));
+      return;
+    }
 
     // Health endpoint — shallow, unauthenticated liveness probe. Must NOT
     // touch credentials or any upstream: in gateway mode credentials only
@@ -247,6 +256,19 @@ export async function startHttpTransport(): Promise<HttpServer> {
 
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health"] }));
+  };
+
+  const httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+    // A throw inside the handler must answer 500, never crash the process.
+    handleHttp(req, res).catch((err: unknown) => {
+      logger.error("HTTP handler error", { error: err instanceof Error ? err.message : String(err) });
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      } else {
+        res.destroy();
+      }
+    });
   });
 
   let mcpClosed = false;

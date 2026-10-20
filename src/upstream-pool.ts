@@ -19,6 +19,8 @@ import { logger } from "./utils/logger.js";
 
 export const DEFAULT_POOL_MAX = 50;
 export const DEFAULT_POOL_IDLE_MS = 10 * 60 * 1000;
+/** How long a new credential waits for a free pool slot when every child is busy. */
+export const DEFAULT_POOL_WAIT_MS = 30_000;
 export const UPSTREAM_PACKAGE = "@acronis-platform/mcp";
 
 export interface UpstreamCallResult {
@@ -159,11 +161,20 @@ interface Entry {
   retired: boolean;
 }
 
+export class PoolBusyError extends Error {
+  constructor() {
+    super("Acronis is busy with other requests right now. Try again in a moment.");
+    this.name = "PoolBusyError";
+  }
+}
+
 export interface PoolOptions {
   toolsInclude: readonly string[];
   spawner?: Spawner;
   max?: number;
   idleMs?: number;
+  /** Max wait for a free slot when the pool is full of busy children. */
+  waitMs?: number;
   now?: () => number;
 }
 
@@ -183,6 +194,11 @@ export function poolOptionsFromEnv(
 
 export class UpstreamPool {
   private readonly entries = new Map<string, Entry>(); // insertion order == LRU order
+  /** Retired children still serving a call; closed when their last call ends (and on shutdown). */
+  private readonly draining = new Set<Entry>();
+  /** Callers waiting for a free slot (every indexed child busy). */
+  private waiters: Array<() => void> = [];
+  private readonly waitMs: number;
   private readonly spawner: Spawner;
   private readonly toolsInclude: readonly string[];
   private readonly max: number;
@@ -196,6 +212,7 @@ export class UpstreamPool {
     this.toolsInclude = [...opts.toolsInclude];
     this.max = opts.max ?? DEFAULT_POOL_MAX;
     this.idleMs = opts.idleMs ?? DEFAULT_POOL_IDLE_MS;
+    this.waitMs = opts.waitMs ?? DEFAULT_POOL_WAIT_MS;
     this.now = opts.now ?? Date.now;
   }
 
@@ -215,24 +232,79 @@ export class UpstreamPool {
     if (this.closed) throw new Error("Upstream pool is closed");
     this.evictIdle();
     const key = credentialKey(creds);
-    let entry = this.entries.get(key);
-    if (entry) {
-      // refresh LRU position
-      this.entries.delete(key);
-      this.entries.set(key, entry);
-    } else {
-      entry = this.create(key, creds);
-    }
-    entry.lastUsed = this.now();
-    entry.inUse++;
+    const entry = await this.acquire(key, creds);
     try {
       const conn = await entry.conn;
       return await fn(conn);
     } finally {
       entry.inUse--;
       entry.lastUsed = this.now();
-      if (entry.retired && entry.inUse === 0) void this.closeEntry(entry);
+      if (entry.inUse === 0) {
+        if (entry.retired) {
+          this.draining.delete(entry);
+          void this.closeEntry(entry);
+        }
+        this.wake();
+      }
     }
+  }
+
+  /**
+   * Find or spawn the child for key and mark it in use. Busy children are
+   * never evicted: when the pool is full and every child is busy, a new
+   * credential waits for a slot (up to waitMs), then fails with PoolBusyError.
+   */
+  private async acquire(key: string, creds: AcronisCredentials): Promise<Entry> {
+    const deadline = this.now() + this.waitMs;
+    for (;;) {
+      if (this.closed) throw new Error("Upstream pool is closed");
+      const existing = this.entries.get(key);
+      if (existing) {
+        // refresh LRU position
+        this.entries.delete(key);
+        this.entries.set(key, existing);
+        existing.lastUsed = this.now();
+        existing.inUse++;
+        return existing;
+      }
+      if (this.hasCapacity()) {
+        const entry = this.create(key, creds);
+        entry.inUse++;
+        return entry;
+      }
+      const remaining = deadline - this.now();
+      if (remaining <= 0) throw new PoolBusyError();
+      await this.waitForSlot(remaining);
+    }
+  }
+
+  /** Room for one more child, after evicting an idle one if needed. */
+  private hasCapacity(): boolean {
+    if (this.entries.size < this.max) return true;
+    const idle = [...this.entries.values()].find((e) => e.inUse === 0);
+    if (!idle) return false;
+    logger.debug("Upstream child evicted (LRU)", { poolKey: idle.key.slice(0, 12) });
+    this.drop(idle);
+    return this.entries.size < this.max;
+  }
+
+  private waitForSlot(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.waiters = this.waiters.filter((w) => w !== done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      timer.unref?.();
+      this.waiters.push(done);
+    });
+  }
+
+  private wake(): void {
+    const waiting = this.waiters;
+    this.waiters = [];
+    for (const w of waiting) w();
   }
 
   private create(key: string, creds: AcronisCredentials): Entry {
@@ -249,25 +321,17 @@ export class UpstreamPool {
     entry.conn.catch(() => this.drop(entry)); // failed spawn must not poison the key
     this.entries.set(key, entry);
     logger.debug("Upstream child spawned", { poolKey: key.slice(0, 12), size: this.entries.size });
-    this.enforceMax(entry);
     this.startSweeper();
     return entry;
   }
 
   private drop(entry: Entry): void {
     if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
+    if (entry.retired) return;
     entry.retired = true;
     if (entry.inUse === 0) void this.closeEntry(entry);
-  }
-
-  private enforceMax(keep: Entry): void {
-    while (this.entries.size > this.max) {
-      const victim = [...this.entries.values()].find((e) => e !== keep && e.inUse === 0)
-        ?? [...this.entries.values()].find((e) => e !== keep);
-      if (!victim) return;
-      logger.debug("Upstream child evicted (LRU)", { poolKey: victim.key.slice(0, 12) });
-      this.drop(victim);
-    }
+    else this.draining.add(entry); // still serving: keep tracked so close() reaches it
+    this.wake();
   }
 
   /** Evict entries idle longer than idleMs. */
@@ -305,8 +369,10 @@ export class UpstreamPool {
     this.closed = true;
     if (this.sweeper) clearInterval(this.sweeper);
     this.sweeper = undefined;
-    const all = [...this.entries.values()];
+    const all = [...this.entries.values(), ...this.draining];
     this.entries.clear();
+    this.draining.clear();
+    this.wake();
     await Promise.all(
       all.map((e) => {
         e.retired = true;

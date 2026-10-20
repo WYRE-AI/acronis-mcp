@@ -101,14 +101,18 @@ export function errorResult(
   };
 }
 
-function redactStructured(value: unknown, depth = 0): unknown {
+function redactStructured(value: unknown, depth = 0, secrets: readonly string[] = []): unknown {
   if (depth > 32) return REDACTED;
-  if (typeof value === "string") return redactText(value);
-  if (Array.isArray(value)) return value.map((v) => redactStructured(v, depth + 1));
+  if (typeof value === "string") {
+    let text = redactText(value);
+    for (const s of secrets) if (s.length >= 4) text = text.split(s).join(REDACTED);
+    return text;
+  }
+  if (Array.isArray(value)) return value.map((v) => redactStructured(v, depth + 1, secrets));
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = isSensitiveKey(k) ? REDACTED : redactStructured(v, depth + 1);
+      out[k] = isSensitiveKey(k) ? REDACTED : redactStructured(v, depth + 1, secrets);
     }
     return out;
   }
@@ -141,7 +145,7 @@ export function sanitizeToolResult(
 
   const out: SanitizedResult = { content };
   if (result.structuredContent !== undefined) {
-    const structured = redactStructured(result.structuredContent);
+    const structured = redactStructured(result.structuredContent, 0, secrets);
     // Structured payloads must obey the same cap; drop rather than truncate JSON.
     if (Buffer.byteLength(JSON.stringify(structured), "utf8") <= MAX_TEXT_BYTES) {
       out.structuredContent = structured;

@@ -103,6 +103,14 @@ describe("sanitizeToolResult", () => {
     expect(res.structuredContent).toEqual({ client_secret: REDACTED, n: 1 });
   });
 
+  it("redacts supplied secrets inside structuredContent string values", () => {
+    const res = sanitizeToolResult(
+      { content: [{ type: "text", text: "ok" }], structuredContent: { note: "id cid-1234 / s3cret-value", nested: [{ v: "s3cret-value" }] } },
+      ["s3cret-value", "cid-1234"]
+    );
+    expect(JSON.stringify(res.structuredContent)).not.toMatch(/s3cret-value|cid-1234/);
+  });
+
   it("converts upstream errors to {error:{code,message}} capped at 500 chars", () => {
     const res = sanitizeToolResult(
       { isError: true, content: [{ type: "text", text: "boom ".repeat(400) }] },

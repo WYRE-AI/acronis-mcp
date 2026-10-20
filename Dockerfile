@@ -47,8 +47,9 @@ USER acronis
 
 EXPOSE 8080
 
+# stdio mode serves no HTTP, so the probe only runs for MCP_TRANSPORT=http.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+  CMD [ "$MCP_TRANSPORT" != "http" ] || wget --no-verbose --tries=1 --spider "http://localhost:${MCP_HTTP_PORT:-8080}/health" || exit 1
 
 ENV NODE_ENV=production
 ENV LOG_LEVEL=info
