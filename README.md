@@ -79,8 +79,8 @@ threshold, descriptions are cut to the first sentence (max 300 chars) with the
 | Surface | Before (upstream, full) | After (wrapper) |
 |---|---|---|
 | Upstream, all 159 tools | 298,320 | n/a (not exposed) |
-| 34 read tools | 70,343 | 66,981 |
-| 37 tools (reads + writes) | 75,822 | 72,432 |
+| 34 read tools | 70,343 | 67,309 |
+| 37 tools (reads + writes) | 75,822 | 72,864 |
 
 (Schemas dominate the payload and are kept from upstream, so description trimming saves ~5%.)
 
@@ -94,27 +94,27 @@ threshold, descriptions are cut to the first sentence (max 300 chars) with the
 | `acronis_fetch_user` | read | Account Management API 2 |
 | `acronis_fetch_current_user_info` | read | Account Management API 2 |
 | `acronis_search` | read | Account Management API 2 |
-| `acronis_fetch_tenant_mfastatus` | read | Account Management API 2 |
+| `acronis_fetch_tenant_mfa_status` | read | Account Management API 2 |
 | `acronis_fetch_tenant_usages` | read | Account Management API 2 |
 | `acronis_fetch_all_alerts` | read | Alert Manager 1.0 |
-| `acronis_fetch_an_alert_by_id` | read | Alert Manager 1.0 |
+| `acronis_fetch_alert` | read | Alert Manager 1.0 |
 | `acronis_fetch_categories` | read | Alert Manager 1.0 |
 | `acronis_fetch_alert_counters` | read | Alert Manager 1.0 |
 | `acronis_fetch_alerts_grouped_by_scope` | read | Alert Manager 1.0 |
 | `acronis_fetch_all_alert_types` | read | Alert Manager 1.0 |
-| `acronis_fetch_resources_containing_the_highest_severity_alerts` | read | Alert Manager 1.0 |
-| `acronis_fetch_partner_s_customer_alerts_count` | read | Alert Manager 1.0 |
+| `acronis_fetch_resources_with_top_severity_alerts` | read | Alert Manager 1.0 |
+| `acronis_fetch_alert_counts_per_customer` | read | Alert Manager 1.0 |
 | `acronis_fetch_alerts_grouped_per_customer` | read | Alert Manager 1.0 |
-| `acronis_get_count_of_active_alerts_and_last_modification_time` | read | Alert Manager 1.0 |
-| `acronis_fetch_a_list_of_policies` | read | Resource and Policy Management API v4 |
-| `acronis_fetch_a_policy` | read | Resource and Policy Management API v4 |
-| `acronis_fetch_a_list_of_policy_applications` | read | Resource and Policy Management API v4 |
+| `acronis_fetch_active_alert_count` | read | Alert Manager 1.0 |
+| `acronis_fetch_policies` | read | Resource and Policy Management API v4 |
+| `acronis_fetch_policy` | read | Resource and Policy Management API v4 |
+| `acronis_fetch_policy_applications` | read | Resource and Policy Management API v4 |
 | `acronis_fetch_applications_issue_statistics` | read | Resource and Policy Management API v4 |
 | `acronis_fetch_application_statuses_by_policy` | read | Resource and Policy Management API v4 |
-| `acronis_fetch_a_list_of_all_resources` | read | Resource and Policy Management API v4 |
-| `acronis_fetch_a_count_of_all_resources_that_match_filter_parameters` | read | Resource and Policy Management API v4 |
-| `acronis_fetch_a_resource_by_id` | read | Resource and Policy Management API v4 |
-| `acronis_fetch_the_protection_status_of_resources` | read | Resource and Policy Management API v4 |
+| `acronis_fetch_resources` | read | Resource and Policy Management API v4 |
+| `acronis_fetch_resource_count` | read | Resource and Policy Management API v4 |
+| `acronis_fetch_resource` | read | Resource and Policy Management API v4 |
+| `acronis_fetch_resource_protection_status` | read | Resource and Policy Management API v4 |
 | `acronis_fetch_agents` | read | Agent Management REST API 2 |
 | `acronis_fetch_agent` | read | Agent Management REST API 2 |
 | `acronis_fetch_incidents` | read | Endpoint Detection and Response API 1.0 |
@@ -122,7 +122,7 @@ threshold, descriptions are cut to the first sentence (max 300 chars) with the
 | `acronis_fetch_response_action_status` | read | Endpoint Detection and Response API 1.0 |
 | `acronis_mark_alert_as_false_positive` | write | Alert Manager 1.0 |
 | `acronis_update_investigation_state` | write | Endpoint Detection and Response API 1.0 |
-| `acronis_execute_a_protection_policy` | write | Resource and Policy Management API v4 |
+| `acronis_execute_protection_policy` | write | Resource and Policy Management API v4 |
 ### Excluded categories
 
 Not exposed and not callable, whatever the environment:
@@ -228,13 +228,13 @@ outbound HTTPS to the Acronis datacenters.
 
 ```bash
 docker build --platform linux/amd64 -t acronis-mcp .
-docker run -e CONDUIT_S2S_SECRET=your-s2s-secret -p 127.0.0.1:8080:8080 acronis-mcp
+docker run -e CONDUIT_S2S_SECRET="$(openssl rand -hex 32)" -p 127.0.0.1:8080:8080 acronis-mcp
 ```
 
 Compose refuses to start when `CONDUIT_S2S_SECRET` is unset and does not inject `ACRONIS_*`:
 
 ```bash
-CONDUIT_S2S_SECRET=your-s2s-secret docker compose up
+CONDUIT_S2S_SECRET="$(openssl rand -hex 32)" docker compose up
 ```
 
 ## Development

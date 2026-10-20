@@ -29,6 +29,8 @@ export { GATEWAY_HEADERS, resolveEnvCredentials, resolveGatewayCredentials };
 export interface ServerDeps {
   pool: UpstreamPool;
   writes: boolean;
+  /** True when credentials come from gateway headers (AUTH_MODE=gateway). Picks the user-facing error copy. */
+  gatewayMode?: boolean;
 }
 
 /** Build the process-wide pool for the current environment. */
@@ -53,7 +55,7 @@ export function makeMcpServerFactory(
       const { credentials } = resolveGatewayCredentials(
         (name) => ctx.requestInfo?.headers.get(name) ?? undefined
       );
-      return createMcpServer(deps, credentials);
+      return createMcpServer({ ...deps, gatewayMode: true }, credentials);
     }
     return createMcpServer(deps, resolveEnvCredentials().credentials);
   };
@@ -73,13 +75,14 @@ export async function handleToolCall(
   // Second enforcement layer (the child also gets MCP_TOOLS_INCLUDE).
   const upstreamName = resolveUpstreamName(name, deps.writes);
   if (!upstreamName) {
-    return errorResult("tool_not_found", "Unknown or disabled tool");
+    return errorResult("tool_not_found", "This Acronis tool isn't available. It may be turned off for this connection.");
   }
   if (!credentials) {
     return errorResult(
       "missing_credentials",
-      "Missing Acronis credentials. Set ACRONIS_BASE_URL, ACRONIS_CLIENT_ID and ACRONIS_CLIENT_SECRET (env mode) " +
-        "or send the X-Acronis-Base-Url, X-Acronis-Client-Id and X-Acronis-Client-Secret gateway headers."
+      deps.gatewayMode
+        ? "Acronis isn't connected for this organization. An admin can connect it in Conduit under Connections."
+        : "Missing Acronis credentials. Set ACRONIS_BASE_URL, ACRONIS_CLIENT_ID and ACRONIS_CLIENT_SECRET."
     );
   }
   const secrets = [credentials.clientSecret, credentials.clientId];

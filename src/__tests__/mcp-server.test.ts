@@ -42,18 +42,30 @@ function makeDeps(writes: boolean, result: unknown = { content: [{ type: "text",
 }
 
 describe("tier filtering", () => {
+  const resolveExposedName = (upstream: string) => GENERATED_TOOLS.find((g) => g.upstream === upstream)!.tool.name;
+
+  it("renames only through NAME_OVERRIDES: reviewed names are exposed, the child still gets upstream names", () => {
+    const byUpstream = new Map(GENERATED_TOOLS.map((g) => [g.upstream, g.tool.name]));
+    expect(byUpstream.get("fetch_partner_s_customer_alerts_count")).toBe("acronis_fetch_alert_counts_per_customer");
+    expect(byUpstream.get("fetch_tenant_mfastatus")).toBe("acronis_fetch_tenant_mfa_status");
+    expect(byUpstream.get("execute_a_protection_policy")).toBe("acronis_execute_protection_policy");
+    expect(resolveUpstreamName("acronis_fetch_policies", false)).toBe("fetch_a_list_of_policies");
+    expect(resolveUpstreamName("acronis_fetch_a_list_of_policies", false)).toBeUndefined();
+  });
+
   it("exposes exactly the 34 read tools by default, all prefixed acronis_", () => {
     const names = exposedTools(false).map((t) => t.name);
-    expect(names).toEqual(tiers.read.map((n) => `acronis_${n}`));
+    expect(names).toEqual(tiers.read.map((n) => resolveExposedName(n)));
     expect(names).toHaveLength(34);
+    expect(names.every((n) => /^acronis_[a-z0-9_]+$/.test(n))).toBe(true);
   });
 
   it("adds the 3 write tools only when writes are enabled", () => {
     const names = exposedTools(true).map((t) => t.name);
     expect(names).toHaveLength(37);
     for (const w of tiers.write) {
-      expect(names).toContain(`acronis_${w}`);
-      expect(exposedTools(false).map((t) => t.name)).not.toContain(`acronis_${w}`);
+      expect(names).toContain(resolveExposedName(w));
+      expect(exposedTools(false).map((t) => t.name)).not.toContain(resolveExposedName(w));
     }
   });
 
@@ -152,8 +164,8 @@ describe("tools/call enforcement", () => {
     const res = await handleToolCall(deps, CREDS, "acronis_update_investigation_state", { a: 1 });
     expect(res.isError).toBeUndefined();
     expect(calls).toEqual([{ name: "update_investigation_state", args: { a: 1 } }]);
-    expect(resolveUpstreamName("acronis_execute_a_protection_policy", true)).toBe("execute_a_protection_policy");
-    expect(resolveUpstreamName("acronis_execute_a_protection_policy", false)).toBeUndefined();
+    expect(resolveUpstreamName("acronis_execute_protection_policy", true)).toBe("execute_a_protection_policy");
+    expect(resolveUpstreamName("acronis_execute_protection_policy", false)).toBeUndefined();
   });
 
   it("returns missing_credentials for an allowed tool without credentials", async () => {
@@ -162,6 +174,20 @@ describe("tools/call enforcement", () => {
     expect(res.isError).toBe(true);
     expect(JSON.parse(res.content[0].text).error.code).toBe("missing_credentials");
     expect(spawnSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses user-facing copy: Conduit wording in gateway mode, env-var wording only in env mode", async () => {
+    const { deps } = makeDeps(false);
+    const gw = await handleToolCall({ ...deps, gatewayMode: true }, undefined, "acronis_fetch_all_alerts", {});
+    expect(JSON.parse(gw.content[0].text).error.message).toBe(
+      "Acronis isn't connected for this organization. An admin can connect it in Conduit under Connections."
+    );
+    const env = await handleToolCall(deps, undefined, "acronis_fetch_all_alerts", {});
+    expect(JSON.parse(env.content[0].text).error.message).toMatch(/ACRONIS_BASE_URL/);
+    const off = await handleToolCall(deps, CREDS, "acronis_execute_protection_policy", {});
+    expect(JSON.parse(off.content[0].text).error.message).toBe(
+      "This Acronis tool isn't available. It may be turned off for this connection."
+    );
   });
 
   it("sanitises upstream results and never echoes credentials in errors", async () => {

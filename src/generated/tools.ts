@@ -64,7 +64,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_tenants_batch",
-      "description": "Available in cloud version only.",
+      "description": "Gets several tenants at once, by up to 100 tenant IDs, by parent tenant, or as a tenant and everything under it.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -152,7 +152,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_tenant_children",
-      "description": "Fetches a list of UUIDs of the tenant's children.",
+      "description": "Lists the IDs of the tenants directly under a tenant, such as a partner's customers.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -262,7 +262,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_users_batch",
-      "description": "Fetches a batch of users.",
+      "description": "Gets details for several users at once.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -458,7 +458,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_tenant_mfastatus",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_tenant_mfastatus",
+      "name": "acronis_fetch_tenant_mfa_status",
       "description": "Provides MFA status for tenant and progress of TOTP enablement by users.",
       "inputSchema": {
         "type": "object",
@@ -677,7 +677,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_an_alert_by_id",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_an_alert_by_id",
+      "name": "acronis_fetch_alert",
       "description": "Fetches the information about the alert by ID.",
       "inputSchema": {
         "type": "object",
@@ -721,7 +721,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_categories",
-      "description": "Fetches a list of enabled categories.",
+      "description": "Lists the alert categories that are turned on.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -785,7 +785,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_alerts_grouped_by_scope",
-      "description": "Returns the last of the most critical alerts grouped by selected scope.",
+      "description": "Gets the most recent of the most severe alerts for each group, grouped by the scope you choose.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -865,7 +865,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_resources_containing_the_highest_severity_alerts",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_resources_containing_the_highest_severity_alerts",
+      "name": "acronis_fetch_resources_with_top_severity_alerts",
       "description": "Fetches the resources' statuses that contain the alerts with the highest severity found for the resources.",
       "inputSchema": {
         "type": "object",
@@ -898,7 +898,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_partner_s_customer_alerts_count",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_partner_s_customer_alerts_count",
+      "name": "acronis_fetch_alert_counts_per_customer",
       "description": "Fetches count of alerts per customer.",
       "inputSchema": {
         "type": "object",
@@ -1132,7 +1132,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "get_count_of_active_alerts_and_last_modification_time",
     "tier": "read",
     "tool": {
-      "name": "acronis_get_count_of_active_alerts_and_last_modification_time",
+      "name": "acronis_fetch_active_alert_count",
       "description": "Returns count of active alerts and last modification time.",
       "inputSchema": {
         "type": "object"
@@ -1146,8 +1146,8 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_a_list_of_policies",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_a_list_of_policies",
-      "description": "Fetch a list of policies.",
+      "name": "acronis_fetch_policies",
+      "description": "Lists protection policies (called protection plans in the Acronis console).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1267,8 +1267,8 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_a_policy",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_a_policy",
-      "description": "Fetch a policy.",
+      "name": "acronis_fetch_policy",
+      "description": "Gets one protection policy and its settings by ID.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1323,8 +1323,8 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_a_list_of_policy_applications",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_a_list_of_policy_applications",
-      "description": "Fetches a list of policy applications depending on provided filtering parameters.",
+      "name": "acronis_fetch_policy_applications",
+      "description": "Lists where policies are applied, meaning which resources each policy covers, with optional filters.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1455,7 +1455,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_applications_issue_statistics",
-      "description": "Fetches statistics for each issue occurred with applications.",
+      "description": "Counts problems with applied policies, grouped by issue.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1492,7 +1492,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_application_statuses_by_policy",
-      "description": "Fetches a list of applications grouped by provided policy.",
+      "description": "Gets the status of every resource a given policy is applied to.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1587,8 +1587,8 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_a_list_of_all_resources",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_a_list_of_all_resources",
-      "description": "Fetch a list of all resources.",
+      "name": "acronis_fetch_resources",
+      "description": "Lists resources (machines, mailboxes and other workloads), with optional filters.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1698,7 +1698,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_a_count_of_all_resources_that_match_filter_parameters",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_a_count_of_all_resources_that_match_filter_parameters",
+      "name": "acronis_fetch_resource_count",
       "description": "Fetch a count of all resources that match filter parameters.",
       "inputSchema": {
         "type": "object",
@@ -1789,8 +1789,8 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_a_resource_by_id",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_a_resource_by_id",
-      "description": "Fetch a resource by id.",
+      "name": "acronis_fetch_resource",
+      "description": "Gets one resource (a machine, mailbox or other workload) by ID.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1850,8 +1850,8 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "fetch_the_protection_status_of_resources",
     "tier": "read",
     "tool": {
-      "name": "acronis_fetch_the_protection_status_of_resources",
-      "description": "Fetch the protection status of resources.",
+      "name": "acronis_fetch_resource_protection_status",
+      "description": "Shows which resources are protected and which aren't.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1936,7 +1936,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_agents",
-      "description": "Fetches all registered agents seen from specified tenant.",
+      "description": "Lists the Acronis agents installed on machines in a tenant.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2028,7 +2028,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_agent",
-      "description": "Fetches the specific agent.",
+      "description": "Gets one Acronis agent by ID.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2060,7 +2060,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_incidents",
-      "description": "Returns a list of incidents.",
+      "description": "Lists EDR security incidents, with optional filters.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2260,7 +2260,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_incident",
-      "description": "Returns incident detailed info.",
+      "description": "Gets the details of one EDR security incident by ID.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2341,7 +2341,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "read",
     "tool": {
       "name": "acronis_fetch_response_action_status",
-      "description": "Get Detailed status of initiated action.",
+      "description": "Gets the status of a response action that was started on an incident, such as isolating a machine.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2397,7 +2397,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "write",
     "tool": {
       "name": "acronis_mark_alert_as_false_positive",
-      "description": "Marks or unmarks alert as false positive.",
+      "description": "Marks an alert as a false positive, or clears that mark. This changes the alert in Acronis for everyone.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2444,7 +2444,7 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "tier": "write",
     "tool": {
       "name": "acronis_update_investigation_state",
-      "description": "Post update for an investigation state accompanied with comment or post a new comment for an incident by MDR vendor.",
+      "description": "Changes an incident's investigation state, or adds a comment to the incident. The change is saved in Acronis.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2560,8 +2560,8 @@ export const GENERATED_TOOLS: GeneratedTool[] = [
     "upstream": "execute_a_protection_policy",
     "tier": "write",
     "tool": {
-      "name": "acronis_execute_a_protection_policy",
-      "description": "Executes a protection policy on all resources that are subject to this policy application.",
+      "name": "acronis_execute_protection_policy",
+      "description": "Runs a protection policy right away on every resource it's applied to, which starts backup or protection jobs on those machines. Admin only.",
       "inputSchema": {
         "type": "object",
         "properties": {

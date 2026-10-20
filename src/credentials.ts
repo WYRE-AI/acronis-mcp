@@ -47,7 +47,7 @@ export function validateBaseUrl(raw: string | undefined): { url?: string; error?
     return { error: "Acronis base URL must use the default https port" };
   }
   if ((parsed.pathname !== "/" && parsed.pathname !== "") || parsed.search || parsed.hash) {
-    return { error: "Acronis base URL must be a bare origin (no path, query or fragment)" };
+    return { error: "The Acronis Data center URL must be just the address, such as https://us5-cloud.acronis.com, with nothing after .com. Reconnect Acronis in Conduit with that address." };
   }
   const host = parsed.hostname.toLowerCase();
   if (!host.endsWith(ALLOWED_HOST_SUFFIX) || host.length === ALLOWED_HOST_SUFFIX.length) {
