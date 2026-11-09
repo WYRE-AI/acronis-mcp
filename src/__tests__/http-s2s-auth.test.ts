@@ -498,6 +498,30 @@ describe("HTTP /mcp authentication", () => {
     }
   });
 
+  it.each(["//h:99999/", "//[::1/mcp", "//user@:0x/health"])(
+    "answers 400 for the malformed request target %s without an unhandled rejection",
+    async (path) => {
+      expect(() => new URL(path, "http://localhost")).toThrow();
+      const rejections: unknown[] = [];
+      const onRejection = (reason: unknown) => rejections.push(reason);
+      process.on("unhandledRejection", onRejection);
+      try {
+        const server = await listen();
+        const response = await sendHttp({ port: server.port, method: "GET", path });
+        expect(response.status).toBe(400);
+        expect(JSON.parse(response.body)).toEqual({ error: "Bad request" });
+        // The server keeps serving afterwards.
+        const health = await sendHttp({ port: server.port, method: "GET", path: "/health" });
+        expect(health.status).toBe(200);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(rejections).toEqual([]);
+        expect(spawnCalls).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onRejection);
+      }
+    }
+  );
+
   it("serves /health and /healthz without authentication and without reading credentials", async () => {
     const server = await listen();
     for (const path of ["/health", "/healthz"]) {
