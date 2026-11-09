@@ -38,6 +38,10 @@ describe("redaction runs in linear time", () => {
     ["quoted keys without colons", (n) => fill('"x-token-x" ', n)],
     ["Bearer repeated", (n) => fill("Bearer ", n)],
     ["Bearer then whitespace", (n) => `Bearer${" ".repeat(n - 6)}`],
+    ["Bearer glued to dashes", (n) => fill("Bearer-", n)],
+    ["Basic repeated", (n) => fill("Basic ", n)],
+    ["glued JWT-shaped segments", (n) => fill("xeyJabcdefgh.", n)],
+    ["[REDACTED]. repeated", (n) => fill(`${REDACTED}.x`, n)],
   ];
 
   const bestMs = (fn: () => void) => {
@@ -71,6 +75,30 @@ describe("redaction runs in linear time", () => {
   });
 });
 
+describe("no regex stack overflow on huge values", () => {
+  // A regex repeat such as "(?:[^"\\]|\\.)*" or [A-Za-z0-9+/=]{8,} throws
+  // RangeError once one match spans a few million characters.
+  const N = 32_000_000;
+  const big = "a".repeat(N);
+  it.each([
+    ["JSON string value", `{"token":"${big}"}`, `{"token":"${REDACTED}"}`],
+    ["JSON string value with escapes", `{"token":"${"\\n".repeat(N / 2)}"}`, `{"token":"${REDACTED}"}`],
+    ["JSON number value", `{"token":${"1".repeat(N)}}`, `{"token":"${REDACTED}"}`],
+    ["plain quoted value", `token="${big}" x`, `token=${REDACTED} x`],
+    ["plain bare value", `token=${big} x`, `token=${REDACTED} x`],
+    ["Bearer token", `Bearer ${big} x`, `Bearer ${REDACTED} x`],
+    ["Basic token", `Basic ${big} x`, `Basic ${REDACTED} x`],
+    ["JWT signature", `eyJabcdefgh.abcdefgh.${big} x`, `${REDACTED} x`],
+  ])("%s of 32M chars", (_name, input, expected) => {
+    expect(redactText(input)).toBe(expected);
+  });
+
+  it("leaves a 32M-char unclosed JSON string alone", () => {
+    const input = `{"token":"${big}`;
+    expect(redactText(input)).toBe(input);
+  });
+});
+
 describe("JWT redaction", () => {
   it("redacts a JWT glued to the end of another JWT", () => {
     const out = redactText(`a ${JWT}${JWT2} b`);
@@ -97,6 +125,16 @@ describe("JWT redaction", () => {
     const out = redactText(`host.example.com.${JWT}`);
     expectGone(out, JWT);
     expect(out).toBe(`host.example.com.${REDACTED}`);
+  });
+
+  it("redacts a JWT whose header follows a JWT-shaped segment", () => {
+    // The first segment passes for a header, so the real header is taken as its
+    // payload. The real JWT starts inside that match and must extend it.
+    for (const prefix of ["xeyJaaaaa.", "eyJaaaaa.", "id-eyJaaaaa.", `${HEADER}.`]) {
+      const out = redactText(`a ${prefix}${JWT} b`);
+      expectGone(out, JWT);
+      expect(out).toMatch(/^a \S*\[REDACTED\] b$/);
+    }
   });
 
   it("still redacts an unsigned JWT (empty signature)", () => {
@@ -133,5 +171,86 @@ describe("key/value redaction is unchanged", () => {
     "Basic auth is disabled",
   ])("leaves %j untouched", (text) => {
     expect(redactText(text)).toBe(text);
+  });
+});
+
+/**
+ * The regexes this module used before it switched to scanners. They are
+ * super-linear, so they run here only on short inputs, as the reference that
+ * the scanners must never redact less than.
+ */
+function legacyRedactText(text: string): string {
+  const key = "(?:secret|password|token|access_token|refresh_token|api[_-]?key|authorization|client_secret)";
+  const jsonKv = new RegExp(
+    `("(?:[^"\\\\]|\\\\.)*${key}(?:[^"\\\\]|\\\\.)*"\\s*:\\s*)("(?:[^"\\\\]|\\\\.)*"|-?[\\w.+-]+)`,
+    "gi"
+  );
+  const plainKv = new RegExp(`(\\b[\\w-]*${key}[\\w-]*\\s*[=:]\\s*)("[^"]*"|'[^']*'|[^\\s,;&"'}]+)`, "gi");
+  return text
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, `Bearer ${REDACTED}`)
+    .replace(/\bBasic\s+[A-Za-z0-9+/=]{8,}/gi, `Basic ${REDACTED}`)
+    .replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g, REDACTED)
+    .replace(jsonKv, (_m, prefix: string) => `${prefix}"${REDACTED}"`)
+    .replace(plainKv, (_m, prefix: string) => `${prefix}${REDACTED}`);
+}
+
+describe("never redacts less than the legacy regexes", () => {
+  /** Deterministic PRNG (mulberry32) so a failure reproduces. */
+  function rng(seed: number) {
+    return () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const NOISE = ["eyJ", "eyJaaaaa", "xeyJaaaaa", ".", "-", "_", " ", "x", '"', "\\", ":", "=", "token", "'", "}", "\n", ",", "Bearer ", "Basic ", "{", "&"];
+  // Each planted secret carries unique markers ("S7zS"), so a marker that the
+  // legacy output lacks must be missing from the new output too.
+  const PLANTS: Array<(mark: (tag: string) => string) => string> = [
+    (mark) => `eyJ${mark("H")}hdr.${mark("P")}pay.${mark("S")}sig`,
+    (mark) => `eyJ${mark("H")}hdr.${mark("P")}pay.`,
+    (mark) => `token=${mark("V")}`,
+    (mark) => `"api_key": "${mark("V")}"`,
+    (mark) => `"x_token":${mark("V")}`,
+    (mark) => `password: '${mark("V")} v'`,
+    (mark) => `Bearer ${mark("B")}tokenxx`,
+    (mark) => `Basic ${mark("Q")}basicxx`,
+  ];
+  const VERIFIER = [`xeyJaaaaa.${JWT}`, `eyJaaaaa.${JWT}`, `id-eyJaaaaa.${JWT}`, `${JWT}${JWT2}`];
+
+  function check(input: string, secrets: string[]) {
+    const legacy = legacyRedactText(input);
+    const current = redactText(input);
+    for (const s of secrets) {
+      if (!legacy.includes(s)) expect(current, `input ${JSON.stringify(input)}`).not.toContain(s);
+    }
+    // The passes before the last JWT pass reproduce the legacy output exactly;
+    // the last pass only acts on "eyJ" or "[REDACTED]." in it.
+    if (!legacy.includes("eyJ") && !legacy.includes(`${REDACTED}.`)) {
+      expect(current, `input ${JSON.stringify(input)}`).toBe(legacy);
+    }
+  }
+
+  it.each(VERIFIER)("%s", (input) => {
+    check(input, [SIG, JWT2.split(".")[2]]);
+  });
+
+  it("on 20k random secret-bearing inputs", () => {
+    const next = rng(8);
+    const pick = <T>(xs: T[]) => xs[Math.floor(next() * xs.length)];
+    for (let iter = 0; iter < 20_000; iter++) {
+      const markers: string[] = [];
+      const mark = (tag: string) => {
+        const marker = `${tag}${markers.length}z${tag}`;
+        markers.push(marker);
+        return marker;
+      };
+      const parts: string[] = [];
+      for (let p = 1 + Math.floor(next() * 12); p > 0; p--) {
+        parts.push(next() < 0.5 ? pick(NOISE) : pick(PLANTS)(mark));
+      }
+      check(parts.join(""), markers);
+    }
   });
 });

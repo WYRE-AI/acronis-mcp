@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Key/value output is unchanged.
 - JWT-shaped tokens glued to a word (`id_eyJ…`) or to the end of another JWT
   are now fully redacted, including the second token's payload and signature.
+- A JWT whose header follows a JWT-shaped segment (`eyJaaaaa.<jwt>`,
+  `xeyJaaaaa.<jwt>`) no longer keeps its signature. The extra JWT redaction
+  now runs after the key/value passes, so it can no longer remove a key name
+  (`…eyJ….payload.password: x`) and let that key's value through. Redaction
+  never covers less than the former regexes did.
+- Redaction no longer throws `RangeError: Maximum call stack size exceeded`
+  when a JSON string value, a `Bearer`/`Basic` token or another single match
+  is a few million characters long. Values and tokens are now found by forward
+  scans instead of regex repeats.
 
 ### Added
 
