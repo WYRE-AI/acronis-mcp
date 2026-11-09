@@ -22,9 +22,9 @@ jobs:
       packages: write
       id-token: write
       security-events: write
-    # Pinned to WYRE-AI/reusable-workflows#3 (private-repo-safe Security Scan and
-    # MCP Registry publish). Repin to that PR's merge commit once it lands.
-    uses: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-release.yml@b1bf1ba5bc31ac31725fb5d2961b887eedde860f
+    # WYRE-AI/reusable-workflows#3 merge commit (private-repo-safe Security Scan and
+    # MCP Registry publish).
+    uses: WYRE-AI/reusable-workflows/.github/workflows/mcp-server-release.yml@508ef4ddcd19285d108423a27f44078a15451575
     with:
       server-name: acronis-mcp
       image-name: ghcr.io/wyre-ai/acronis-mcp
