@@ -79,7 +79,10 @@ ENV MCP_HTTP_HOST=0.0.0.0
 # fall back to ACRONIS_* environment variables.
 ENV AUTH_MODE=gateway
 
-CMD ["node", "dist/index.js"]
+# The wrapper's own memory is part of the 0.5 Gi budget (README "Pool sizing"):
+# cap its heap and young generation so one busy period cannot grow it past what
+# scripts/sustained-load.mjs measured. That script reads these flags from here.
+CMD ["node", "--max-old-space-size=64", "--max-semi-space-size=1", "dist/index.js"]
 
 ARG VERSION="unknown"
 ARG COMMIT_SHA="unknown"

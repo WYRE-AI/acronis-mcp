@@ -81,6 +81,7 @@ beforeAll(async () => {
   process.env.MCP_HTTP_PORT = "0";
   process.env.MCP_HTTP_HOST = "127.0.0.1";
   process.env.LOG_LEVEL = "error";
+  process.env.ACRONIS_MEMORY_LIMIT_MB = "1024"; // room for the two tenants' children (0.5 Gi allows one)
   setDefaultSpawner(
     createStdioSpawner({
       API_BASE_URL: fakeOrigin,
@@ -95,6 +96,7 @@ afterAll(async () => {
   setDefaultSpawner(undefined);
   delete process.env.CONDUIT_S2S_SECRET;
   delete process.env.AUTH_MODE;
+  delete process.env.ACRONIS_MEMORY_LIMIT_MB;
   rmSync(recordDir, { recursive: true, force: true });
 });
 

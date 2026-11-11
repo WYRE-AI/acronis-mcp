@@ -9,18 +9,21 @@ import { tmpdir } from "node:os";
  * The pool key is sha256(baseUrl + clientId + clientSecret); raw credential
  * values are never logged.
  *
- * Memory is the hard limit (WYREAI-711), and the PEAK of a child counts, not
- * its idle size. Measured with the real child (Node 26, macOS; not Linux):
- * idle ~109 MiB, ~145 MiB peak with two calls each returning 450 KiB, ~177 MiB
- * with two returning 900 KiB (hence the 512 KiB response cap in
- * child-egress-guard.cjs). Each child also runs with --max-old-space-size, so a
- * runaway child dies alone. The fleet gives this container 0.5 Gi
- * (azure/vendor-fleet.bicep `memory`) and the wrapper needs ~70 MiB, so the
- * ceiling on children is derived from the container's memory limit
- * (poolCeilingForMemory): 2 at 0.5 Gi, which also leaves room for one extra
- * child while a replacement spawns. Beyond the ceiling a new credential waits
- * in a short, bounded queue and is then refused with PoolBusyError; it never
- * spawns.
+ * Memory is the hard limit (WYREAI-711), and what counts is the PEAK of the
+ * wrapper and of each child under SUSTAINED load, not idle sizes or a one-shot
+ * call. scripts/sustained-load.mjs measures it with the real wrapper process,
+ * real children and the real egress guard (Node 26, macOS; NOT Linux, NOT in the
+ * image): wrapper idle ~85 and peak ~137 MiB (it runs --max-old-space-size=64),
+ * child idle ~113 and peak ~126 MiB (one call at a time, a response of at most
+ * the guard's 256 KiB cap), 2 children + the wrapper ~385 MiB, and a third child
+ * starting on top ~485 MiB. Each child also runs with a heap cap so a runaway
+ * child dies alone.
+ *
+ * poolCeilingForMemory turns those peaks into a child count with a 15% margin:
+ * 1 child at 0.5 Gi (the fleet today, azure/vendor-fleet.bicep `memory`), 4 at
+ * 1 Gi. The pool is never above max children plus the one replacement that
+ * starts before an idle child is evicted. Beyond that a new credential waits in a
+ * short, bounded queue and is then refused with PoolBusyError; it never spawns.
  */
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -31,20 +34,30 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { AcronisCredentials } from "./credentials.js";
 import { logger } from "./utils/logger.js";
 
-/** V8 old-space cap for each child (MiB). A runaway child dies alone instead of taking the container. */
+/**
+ * V8 old-space cap for each child (MiB). A runaway child dies alone instead of
+ * taking the container. With one call at a time and responses of at most 256 KiB
+ * a child ran cleanly under sustained load, with the wrapper stalled, at 32 MiB
+ * (24 MiB ran at about 60% of the throughput, 16 would not start), so 80 is 2.5x
+ * what it needs.
+ */
 export const CHILD_MAX_OLD_SPACE_MB = 80;
-/** Peak RSS budgeted per child (MiB): ~145 measured under the response cap with two calls in flight, plus margin. */
-export const CHILD_PEAK_MB = 160;
-/** RSS of a child that is starting (MiB): one extra spawns while the pool replaces an idle child. */
-export const CHILD_STARTUP_MB = 110;
-/** What the wrapper itself needs (MiB). */
-export const WRAPPER_RESERVE_MB = 70;
+/** V8 young-generation cap for each child and the wrapper (MiB). The default costs ~20 MiB of RSS per process. */
+export const MAX_SEMI_SPACE_MB = 1;
+/** Peak RSS of a child (MiB): ~126 measured under sustained load, rounded up. */
+export const CHILD_PEAK_MB = 130;
+/** RSS of a child that has just started (MiB): ~113 measured. One extra starts before an idle child is evicted. */
+export const CHILD_STARTUP_MB = 115;
+/** Peak RSS of the wrapper under sustained load (MiB): ~137 measured with --max-old-space-size=64, rounded up. */
+export const WRAPPER_PEAK_MB = 140;
+/** Headroom kept on top of the measured peaks, as a fraction of the container's memory. */
+export const MEMORY_MARGIN = 0.15;
 /** Assumed container memory (MiB) when no limit can be read. Conservative on purpose. */
 export const FALLBACK_MEMORY_MB = 512;
 /** Hard ceiling on children whatever the memory. ACRONIS_POOL_MAX above the ceiling is clamped. */
 export const MAX_POOL_MAX = 4;
 /** Calls running at once in one child. More wait, in a bounded queue, then get PoolBusyError. */
-export const MAX_CALLS_PER_CHILD = 2;
+export const MAX_CALLS_PER_CHILD = 1;
 /** A child that has not answered `initialize` (it fetches its token first) by then is killed. */
 export const SPAWN_TIMEOUT_MS = 30_000;
 export const DEFAULT_POOL_IDLE_MS = 10 * 60 * 1000;
@@ -63,14 +76,15 @@ export const UPSTREAM_PACKAGE = "@acronis-platform/mcp";
 
 /**
  * How many children fit in a container with this memory limit (bytes): the
- * wrapper, one child still starting, and the rest at their peak. Unknown or
- * unlimited (0, or a huge cgroup "no limit" value) falls back to 512 MiB.
+ * wrapper at its peak, one child still starting (the replacement), and the rest
+ * at their peak, all inside the limit less MEMORY_MARGIN. Unknown or unlimited
+ * (0, or a huge cgroup "no limit" value) falls back to 512 MiB. At least 1.
  */
 export function poolCeilingForMemory(limitBytes: number | undefined = process.constrainedMemory()): number {
   const known = limitBytes !== undefined && limitBytes > 0 && limitBytes < 2 ** 50;
   const mb = known ? limitBytes / (1024 * 1024) : FALLBACK_MEMORY_MB;
-  const fit = Math.floor((mb - WRAPPER_RESERVE_MB - CHILD_STARTUP_MB) / CHILD_PEAK_MB);
-  return Math.max(1, Math.min(MAX_POOL_MAX, fit));
+  const usable = mb / (1 + MEMORY_MARGIN) - WRAPPER_PEAK_MB - CHILD_STARTUP_MB;
+  return Math.max(1, Math.min(MAX_POOL_MAX, Math.floor(usable / CHILD_PEAK_MB)));
 }
 
 /**
@@ -156,7 +170,7 @@ export function createStdioSpawner(
     const removeHome = () => rm(childHome, { recursive: true, force: true }).catch(() => undefined);
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ["--require", EGRESS_GUARD, `--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, resolveUpstreamBin()],
+      args: ["--require", EGRESS_GUARD, `--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, `--max-semi-space-size=${MAX_SEMI_SPACE_MB}`, resolveUpstreamBin()],
       env: { ...buildChildEnv(creds, toolsInclude), HOME: childHome, ...extraEnv },
       stderr: "pipe",
     });
@@ -213,8 +227,6 @@ export function setDefaultSpawner(spawner: Spawner | undefined): void {
   defaultSpawner = spawner ?? spawnUpstream;
 }
 
-
-
 interface Entry {
   key: string;
   conn: Promise<UpstreamConnection>;
@@ -261,10 +273,12 @@ function positiveInt(raw: string | undefined): number | undefined {
 
 export function poolOptionsFromEnv(
   env: Record<string, string | undefined> = process.env
-): { max: number | undefined; idleMs: number } {
+): { max: number | undefined; idleMs: number; memoryLimitBytes?: number } {
+  const memoryLimitMb = positiveInt(env.ACRONIS_MEMORY_LIMIT_MB);
   return {
     max: positiveInt(env.ACRONIS_POOL_MAX),
     idleMs: positiveInt(env.ACRONIS_POOL_IDLE_MS) ?? DEFAULT_POOL_IDLE_MS,
+    ...(memoryLimitMb ? { memoryLimitBytes: memoryLimitMb * 1024 * 1024 } : {}),
   };
 }
 
@@ -461,10 +475,14 @@ export class UpstreamPool {
   }
 
   /**
-   * Spawn the child for key. With a `victim` (the pool is full), the victim is
-   * evicted only after this spawn succeeds, so a stream of bad or varying
+   * Spawn the child for key. With a `victim` (the pool is full), an idle child
+   * is evicted only after this spawn succeeds, so a stream of bad or varying
    * credentials, whose spawns fail, cannot push healthy tenants' idle children
-   * out. The pool is then briefly one over max, and `replacing` keeps it to one.
+   * out. The victim is chosen again when the spawn finishes, because the one
+   * picked earlier may have been called in the meantime; if no child is idle by
+   * then, the newcomer is refused (and its child closed) rather than exceed the
+   * process budget. So the pool is never above max children plus this one
+   * replacement, and `replacing` keeps it to one.
    */
   private create(key: string, creds: AcronisCredentials, victim?: Entry): Entry {
     const entry: Entry = {
@@ -476,24 +494,22 @@ export class UpstreamPool {
       retired: false,
       conn: undefined as unknown as Promise<UpstreamConnection>,
     };
-    entry.conn = this.spawner(creds, this.toolsInclude, {
+    const spawned = this.spawner(creds, this.toolsInclude, {
       onClose: () => this.drop(entry),
     });
+    entry.conn = victim ? spawned.then((conn) => this.evictForReplacement(entry, victim, conn)) : spawned;
     entry.conn.catch((error: unknown) => {
       this.drop(entry);
-      // Remember the failure briefly so a bad credential cannot respawn on every call.
-      this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
+      // Remember a failed spawn briefly so a bad credential cannot respawn on every call.
+      // A refusal for lack of an idle child to replace says nothing about the credential.
+      if (!(error instanceof PoolBusyError)) {
+        this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
+      }
     });
     if (victim) {
       this.replacing = true;
       entry.conn
-        .then(
-          () => {
-            logger.debug("Upstream child evicted (LRU)", { poolKey: victim.key.slice(0, 12) });
-            this.drop(victim);
-          },
-          () => undefined
-        )
+        .catch(() => undefined)
         .then(() => {
           this.replacing = false;
           this.wake();
@@ -503,6 +519,24 @@ export class UpstreamPool {
     logger.debug("Upstream child spawned", { poolKey: key.slice(0, 12), size: this.entries.size });
     this.startSweeper();
     return entry;
+  }
+
+  /** The newcomer's child is up: make room by closing an idle child, or refuse the newcomer. */
+  private async evictForReplacement(
+    newcomer: Entry,
+    preferred: Entry,
+    conn: UpstreamConnection
+  ): Promise<UpstreamConnection> {
+    if (this.entries.size <= this.max) return conn; // an idle sweep or a child exit already made room
+    const idle = (e: Entry) => e !== newcomer && e.inUse === 0 && this.entries.get(e.key) === e;
+    const victim = idle(preferred) ? preferred : [...this.entries.values()].find(idle);
+    if (!victim) {
+      await conn.close().catch(() => undefined);
+      throw new PoolBusyError();
+    }
+    logger.debug("Upstream child evicted (LRU)", { poolKey: victim.key.slice(0, 12) });
+    this.drop(victim);
+    return conn;
   }
 
   private drop(entry: Entry): void {

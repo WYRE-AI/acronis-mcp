@@ -10,6 +10,10 @@ import {
   poolCeilingForMemory,
   poolOptionsFromEnv,
   resolveUpstreamBin,
+  CHILD_PEAK_MB,
+  CHILD_STARTUP_MB,
+  MEMORY_MARGIN,
+  WRAPPER_PEAK_MB,
   type Spawner,
   type UpstreamConnection,
 } from "../upstream-pool.js";
@@ -98,7 +102,7 @@ describe("UpstreamPool", () => {
 
   it("evicts the least-recently-used entry beyond max and closes it", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 2 });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 2, memoryLimitBytes: 2 ** 30 });
     await use(pool, A);
     await use(pool, B);
     await use(pool, A); // A is now most recent; B is LRU
@@ -156,10 +160,12 @@ describe("UpstreamPool", () => {
     const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
     await new Promise((r) => setTimeout(r, 0));
     const waitingB = use(pool, B);
-    await use(pool, A); // served by the existing A child while B waits
+    const secondA = use(pool, A); // queued on the existing A child (one call at a time), not a second A child
+    await new Promise((r) => setTimeout(r, 10));
     expect(spawned).toHaveLength(1);
     release();
     await held;
+    await secondA;
     await waitingB;
     expect(spawned).toHaveLength(2);
     expect(spawned.filter((s) => s.creds.clientId === "a")).toHaveLength(1);
@@ -267,29 +273,38 @@ describe("UpstreamPool", () => {
   describe("pool cap", () => {
     const MiB = 1024 * 1024;
 
-    it("derives the ceiling from the container's memory: 2 children at 0.5 Gi, never above MAX_POOL_MAX, never below 1", () => {
-      expect(poolCeilingForMemory(512 * MiB)).toBe(2);
+    it("derives the ceiling from the container's memory: 1 child at 0.5 Gi, 4 at 1 Gi, never above MAX_POOL_MAX, never below 1", () => {
+      expect(poolCeilingForMemory(512 * MiB)).toBe(1);
       expect(poolCeilingForMemory(768 * MiB)).toBe(3);
-      expect(poolCeilingForMemory(1024 * MiB)).toBe(MAX_POOL_MAX);
+      expect(poolCeilingForMemory(1024 * MiB)).toBe(4);
       expect(poolCeilingForMemory(64 * 1024 * MiB)).toBe(MAX_POOL_MAX);
       expect(poolCeilingForMemory(200 * MiB)).toBe(1);
     });
 
+    it("keeps the wrapper at its peak, every child at its peak, one replacement and the margin inside the limit", () => {
+      for (const mb of [512, 640, 768, 1024, 2048]) {
+        const n = poolCeilingForMemory(mb * MiB);
+        const peak = WRAPPER_PEAK_MB + n * CHILD_PEAK_MB + CHILD_STARTUP_MB;
+        expect(peak * (1 + MEMORY_MARGIN)).toBeLessThanOrEqual(mb);
+        if (n < MAX_POOL_MAX) expect((peak + CHILD_PEAK_MB) * (1 + MEMORY_MARGIN)).toBeGreaterThan(mb); // and no smaller than it can be
+      }
+    });
+
     it("falls back to the conservative 512 MiB ceiling when the limit is unknown or unlimited", () => {
-      expect(poolCeilingForMemory(0)).toBe(2); // Node reports 0 when it cannot tell
-      expect(poolCeilingForMemory(2 ** 60)).toBe(2); // cgroup "no limit" is a huge number
-      expect(poolCeilingForMemory(Number.NaN)).toBe(2);
+      expect(poolCeilingForMemory(0)).toBe(1); // Node reports 0 when it cannot tell
+      expect(poolCeilingForMemory(2 ** 60)).toBe(1); // cgroup "no limit" is a huge number
+      expect(poolCeilingForMemory(Number.NaN)).toBe(1);
     });
 
     it("uses that ceiling as the default size, and ACRONIS_POOL_MAX can only lower it", async () => {
       expect(poolOptionsFromEnv({}).max).toBeUndefined();
       const { spawner, spawned } = fakeSpawner();
       const pool = new UpstreamPool({ toolsInclude: [], spawner, memoryLimitBytes: 512 * MiB, waitMs: 5 });
-      const held = [A, B].map((c) => pool.withConnection(c, () => new Promise<void>(() => undefined)));
+      const held = pool.withConnection(A, () => new Promise<void>(() => undefined));
       await new Promise((r) => setTimeout(r, 10));
-      expect(spawned).toHaveLength(2);
-      await expect(use(pool, C)).rejects.toBeInstanceOf(PoolBusyError); // a third would not fit 0.5 Gi
-      expect(spawned).toHaveLength(2);
+      expect(spawned).toHaveLength(1);
+      await expect(use(pool, B)).rejects.toBeInstanceOf(PoolBusyError); // a second would not fit 0.5 Gi
+      expect(spawned).toHaveLength(1);
       void held;
       await pool.close();
     });
@@ -452,6 +467,95 @@ describe("UpstreamPool", () => {
     });
   });
 
+  describe("eviction during churn", () => {
+    const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+
+    /** A spawner that counts live children and lets the test hold one tenant's spawn open. */
+    function countingSpawner(slow: string) {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const stats = { live: 0, peakLive: 0, closed: [] as string[] };
+      const spawner: Spawner = async (creds) => {
+        stats.live++;
+        stats.peakLive = Math.max(stats.peakLive, stats.live);
+        if (creds.clientId === slow) await gate;
+        return {
+          callTool: async () => ({}),
+          listToolNames: async () => [],
+          close: async () => {
+            stats.live--;
+            stats.closed.push(creds.clientId);
+          },
+        };
+      };
+      return { spawner, stats, release: () => release() };
+    }
+
+    it("picks the victim again when the replacement is up: a tenant that called in meanwhile is not retired while running", async () => {
+      const { spawner, stats, release } = countingSpawner("b");
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 2, memoryLimitBytes: 2 ** 30 });
+      await use(pool, A); // A and C idle, A the older
+      await use(pool, { ...A, clientId: "c" });
+      const b = use(pool, B); // B starts; A is the chosen victim
+      await tick();
+      let releaseA!: () => void;
+      const aBusy = pool.withConnection(A, () => new Promise<void>((r) => (releaseA = r))); // A calls in while B starts
+      await tick();
+      release();
+      await b;
+      await tick();
+      expect(stats.closed).toEqual(["c"]); // C, the idle one, went; A kept running
+      expect(pool.size).toBe(2);
+      expect(stats.live).toBe(2);
+      releaseA();
+      await aBusy;
+      await pool.close();
+    });
+
+    it("refuses the newcomer, and closes its child, when nothing is idle by the time it is up", async () => {
+      const { spawner, stats, release } = countingSpawner("b");
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+      await use(pool, A);
+      const b = use(pool, B).catch((e: unknown) => e);
+      await tick();
+      let releaseA!: () => void;
+      const aBusy = pool.withConnection(A, () => new Promise<void>((r) => (releaseA = r)));
+      await tick();
+      release();
+      expect(await b).toBeInstanceOf(PoolBusyError);
+      await tick();
+      expect(stats.closed).toEqual(["b"]); // the newcomer's child, not the running one
+      expect(stats.live).toBe(1);
+      expect(pool.keys()).toEqual([credentialKey(A)]);
+      // The refusal says nothing about B's credential, so B may try again once A is idle.
+      releaseA();
+      await aBusy;
+      await use(pool, B);
+      expect(pool.keys()).toEqual([credentialKey(B)]);
+      await pool.close();
+    });
+
+    it("never has more live children than max plus the one replacement, however the tenants churn", async () => {
+      const { spawner, stats } = countingSpawner("never");
+      const max = 2;
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max, memoryLimitBytes: 2 ** 30, waitMs: 2_000 });
+      const tenants = Array.from({ length: 6 }, (_, i) => ({ ...A, clientId: `t${i}` }));
+      await Promise.all(
+        Array.from({ length: 8 }, async (_, caller) => {
+          for (let round = 0; round < 15; round++) {
+            const t = tenants[(caller + round * 3) % tenants.length]!;
+            await pool.withConnection(t, () => tick(1)).catch((e: unknown) => {
+              if (!(e instanceof PoolBusyError)) throw e;
+            });
+          }
+        })
+      );
+      expect(stats.peakLive).toBeLessThanOrEqual(max + 1);
+      await pool.close();
+      expect(stats.live).toBe(0);
+    });
+  });
+
   it("close() closes every child and refuses further use", async () => {
     const { spawner, spawned } = fakeSpawner();
     const pool = new UpstreamPool({ toolsInclude: [], spawner });
@@ -469,6 +573,11 @@ describe("poolOptionsFromEnv", () => {
     expect(poolOptionsFromEnv({})).toEqual({ max: undefined, idleMs: 600_000 });
     expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "5", ACRONIS_POOL_IDLE_MS: "1000" })).toEqual({ max: 5, idleMs: 1000 });
     expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "abc", ACRONIS_POOL_IDLE_MS: "-3" })).toEqual({ max: undefined, idleMs: 600_000 });
+  });
+
+  it("takes the container memory from ACRONIS_MEMORY_LIMIT_MB when the runtime cannot report it", () => {
+    expect(poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "1024" }).memoryLimitBytes).toBe(1024 * 1024 * 1024);
+    expect(poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "0" }).memoryLimitBytes).toBeUndefined();
   });
 });
 
