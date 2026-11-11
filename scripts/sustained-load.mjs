@@ -111,6 +111,7 @@ const worker = spawn(process.execPath, [...WRAPPER_FLAGS, join(here, "sustained-
     LOG_LEVEL: "error",
     NODE_ENV: "production",
     LOAD_MEMORY_MB: String(MEMORY_MB),
+    LOAD_STALL_MS: String(STALL_MS),
     ...(process.env.LOAD_SLICE_MS ? { ACRONIS_POOL_SLICE_MS: process.env.LOAD_SLICE_MS } : {}),
   },
   stdio: ["ignore", "pipe", "inherit"],

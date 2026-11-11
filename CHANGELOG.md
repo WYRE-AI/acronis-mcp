@@ -147,6 +147,9 @@ under "Still open" are NOT done and must stay open until they are.
 
 ### Fixed
 
+- `scripts/sustained-load.mjs` now forwards `LOAD_STALL_MS` to the wrapper it
+  starts, so `LOAD_STALL_MS=0` really turns the event-loop stall off (the
+  wrapper's environment is built from scratch and always ran the default 100).
 - Redaction of upstream tool output is now linear-time. The key/value and JWT
   regexes were quadratic or cubic on hostile text (a 16 KB tool result of
   repeated `-token` took about 57 s; a 4 MB one now takes about 30 ms).
