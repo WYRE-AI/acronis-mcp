@@ -12,22 +12,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Partially clears the conditions of the security review (WYREAI-711). The items
 under "Still open" are NOT done and must stay open until they are.
 
-- Each upstream child is bounded by its peak memory, not its idle size. A
-  child runs with `--max-old-space-size=80`, so one that exhausts its heap dies
-  alone. The egress guard aborts any upstream response body over 512 KiB while
-  it streams, before the bundle buffers and parses it. At most 2 calls run in
-  one child; more wait in a bounded queue and then get `rate_limited`. A child
-  that does not answer `initialize` within 30 s is killed. Measured with the
-  real child on macOS: 109 MiB idle, 145 MiB peak with two 450 KiB responses in
-  flight, 177 MiB with two 900 KiB. Not measured on Linux or in the container.
+- The pool is sized from the PEAK memory of the wrapper and the children under
+  SUSTAINED load, measured with `scripts/sustained-load.mjs` (the real built
+  wrapper, real children, real egress guard, a fake Acronis, the wrapper's event
+  loop stalled as at 0.25 vCPU), and a regression test runs it. Measured on
+  macOS with Node 26 only, not Linux or the image: before, 691 MiB total
+  (wrapper 300, child 200) against a 512 MiB budget; now 330-338 MiB.
+- A child runs with `--max-old-space-size=80 --max-semi-space-size=1`, one call
+  at a time (more wait in a bounded queue, then `rate_limited`), and the wrapper
+  runs with `--max-old-space-size=64 --max-semi-space-size=1`. The egress guard
+  aborts any upstream response body over 256 KiB while it streams, before the
+  bundle buffers and parses it; the wrapper returns it as a
+  `response_too_large` error that names the tool's own narrowing parameters,
+  never as a partial list. A child that does not answer `initialize` within 30 s
+  is killed.
 - The ceiling on children is derived from the container memory
-  (`process.constrainedMemory()`, 512 MiB if unknown): 2 at 0.5 Gi, never above
-  4. `ACRONIS_POOL_MAX` can only lower it.
+  (`process.constrainedMemory()`, or `ACRONIS_MEMORY_LIMIT_MB`, else 512 MiB)
+  from those peaks plus one replacement child and a 15% margin: **1 at 0.5 Gi,
+  4 at 1 Gi**. At 0.5 Gi that means few concurrent tenants, cold starts and
+  `rate_limited`; raising the container to 1 Gi is recommended (a Conduit
+  infrastructure change, not in this repository). `ACRONIS_POOL_MAX` can only
+  lower it.
 - A new credential beyond the ceiling waits in a bounded queue (8 callers,
   30 s) and is then refused with a `rate_limited` error; it never spawns an
-  extra child. A caller that disconnects leaves the queue at once.
-- An idle child is replaced only after its replacement has started, so
-  failing spawns with varying credentials cannot flush healthy tenants.
+  extra child. A caller that disconnects leaves the queue at once. One tenant
+  has at most 9 calls in flight or waiting; the 10th is `rate_limited`.
+- An idle child is replaced only after its replacement has started, and the
+  victim is chosen again when the replacement is up: a tenant that called in
+  meanwhile is not retired while running, and if no child is idle the newcomer
+  is refused. There are never more than max + 1 children alive.
 - A failed child spawn is remembered for 30 s per credential hash (at most 256
   entries), so a bad or revoked credential cannot cause a spawn per call.
 - Host check: the Acronis base URL must be exactly one valid DNS label under
@@ -37,14 +50,17 @@ under "Still open" are NOT done and must stay open until they are.
 - Every upstream child preloads `child-egress-guard.cjs`: its `fetch` can reach
   only the origin of its own `API_BASE_URL` and never follows a redirect, so a
   307/308 from the token endpoint can no longer replay the `client_secret` to
-  another host. The guard requests the URL it checked, so an object whose
-  `toString()` names another URL no longer bypasses it. Defence in depth, not a
-  sandbox. `redirect: "error"` and the 512 KiB cap are untested against a real
-  Acronis tenant.
+  another host. The guard reads the URL once, as a string, and requests that
+  string, so an object whose `toString()` names another URL, a `URL` or
+  `Request` subclass, or a getter that changes between reads no longer bypasses
+  it. Defence in depth, not a sandbox. `redirect: "error"` and the 256 KiB cap
+  are untested against a real Acronis tenant.
 - Supply chain: `scripts/upstream-pin.json` pins the upstream version, its
   lockfile tarball integrity and the sha256 of every file the package runs
   (`bin/cli.js`, which the pool executes, and `dist/bundle.js`; no file may be
-  added or missing). `scripts/verify-upstream.mjs` fails the Docker build,
+  added or missing, and no symlink is allowed under `bin/` or `dist/`). The
+  upstream's own nested `node_modules` is covered only by the lockfile integrity
+  and the read-only `/app`. `scripts/verify-upstream.mjs` fails the Docker build,
   after `npm prune`, and CI on any difference. Dependabot ignores
   `@acronis-platform/mcp`.
 - The image keeps `/app` root-owned and read-only for the app user, so a child
@@ -71,10 +87,11 @@ under "Still open" are NOT done and must stay open until they are.
 ### Changed
 
 - The default and maximum number of upstream children now come from the
-  container memory (2 at 0.5 Gi, at most 4). It was 50 by default. Production
+  container memory (1 at 0.5 Gi, 4 at 1 Gi). It was 50 by default. Production
   has been running the default of 50, so check the number of active tenants
-  before rolling this out: with more than 2 active tenants at 0.5 Gi there are
-  cold starts and `rate_limited` errors.
+  before rolling this out: with more than 1 active tenant at 0.5 Gi there are
+  cold starts and `rate_limited` errors. The wrapper now starts with
+  `--max-old-space-size=64 --max-semi-space-size=1` (Dockerfile `CMD`).
 
 ### Fixed
 
