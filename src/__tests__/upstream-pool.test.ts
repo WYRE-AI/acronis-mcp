@@ -746,6 +746,162 @@ describe("UpstreamPool", () => {
     });
   });
 
+  describe("max + 1 live processes on every path", () => {
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const tenant = (id: string): AcronisCredentials => ({ ...A, clientId: id });
+
+    /**
+     * A spawner that counts processes from the start of a spawn until they have really exited
+     * (a failed or timed-out spawn kills its child first, like the real spawner). `plan` decides
+     * per spawn how long it takes, whether it fails and how long its close takes; `hold` can keep
+     * a spawn open; `exitOf` makes a child exit on its own.
+     */
+    function processCounter(
+      plan: (id: string) => { spawnMs?: number; closeMs?: number; fails?: boolean } = () => ({}),
+      hold: (id: string) => Promise<void> | undefined = () => undefined
+    ) {
+      const stats = { alive: 0, peak: 0 };
+      const onClose = new Map<string, () => void>();
+      const exits = new Map<string, () => void>();
+      const spawner: Spawner = async (creds, _include, ctx) => {
+        const id = creds.clientId;
+        const { spawnMs = 5, closeMs = 0, fails = false } = plan(id);
+        stats.alive++;
+        stats.peak = Math.max(stats.peak, stats.alive);
+        let exited = false;
+        const exit = () => {
+          if (!exited) stats.alive--;
+          exited = true;
+        };
+        onClose.set(id, ctx.onClose);
+        exits.set(id, exit);
+        const limit = ctx.spawnTimeoutMs ?? SPAWN_TIMEOUT_MS;
+        await hold(id);
+        await sleep(Math.min(spawnMs, limit));
+        if (fails || spawnMs > limit) {
+          exit();
+          throw new Error("spawn failed");
+        }
+        return {
+          callTool: async () => ({}),
+          listToolNames: async () => [],
+          close: async () => {
+            await sleep(closeMs);
+            exit();
+          },
+        };
+      };
+      return { spawner, stats, exitOf: (id: string) => (exits.get(id)!(), onClose.get(id)!()) };
+    }
+
+    it("a replaced child that is still starting counts until its spawn has ended, not only for the close cap (max 1, defaults)", async () => {
+      vi.useFakeTimers();
+      // The tenant's client disconnects while its child is starting (30 s); B replaces it at 11.5 s, C replaces B at 21.5 s.
+      const { spawner, stats } = processCounter((id) => (id === "slow" ? { spawnMs: SPAWN_TIMEOUT_MS + 1 } : { spawnMs: 100 }));
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+      const gone = new AbortController();
+      const slow = pool.withConnection(tenant("slow"), async () => undefined, gone.signal).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(1_000);
+      gone.abort();
+      await slow;
+      await vi.advanceTimersByTimeAsync(10_500);
+      const b = pool.withConnection(tenant("b"), () => sleep(0)).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const c = pool.withConnection(tenant("c"), () => sleep(0)).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(40_000);
+      await Promise.all([b, c]);
+      expect(stats.peak).toBeLessThanOrEqual(2);
+      const closing = pool.close();
+      await vi.advanceTimersByTimeAsync(40_000);
+      await closing;
+      expect(stats.alive).toBe(0);
+    });
+
+    it("two replacements never overlap, so a victim cannot be freed by one and dropped busy by the other (max 3)", async () => {
+      // Sequence: V, W, X up. N1 replaces V. X leaves, so the pool is back at max with nothing closing.
+      // N2 must not pick V as well: if it failed, V would serve a call and then be dropped, busy and
+      // untracked, when N1 came up, and a third and fourth newcomer would start beside it.
+      // Each newcomer's spawn is held open until the test opens its gate (which may come before the spawn starts).
+      const gates = new Map(["n1", "n2", "n3", "n4"].map((id) => {
+        let open!: () => void;
+        return [id, { opened: new Promise<void>((r) => (open = r)), open }] as const;
+      }));
+      const gated = (id: string) => gates.get(id)?.opened;
+      const open = (id: string) => gates.get(id)?.open();
+      const counter = processCounter((id) => ({ fails: id === "n2" }), gated);
+      const spawner = counter.spawner;
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 3, memoryLimitBytes: 2 ** 30, waitMs: 60_000 });
+      for (const id of ["v", "w", "x"]) await use(pool, tenant(id));
+      const swallow = (p: Promise<unknown>) => p.catch(() => undefined);
+      const n1 = swallow(use(pool, tenant("n1"))); // replaces V
+      await sleep(10);
+      counter.exitOf("x"); // X leaves while N1 starts
+      await sleep(10);
+      const n2 = swallow(use(pool, tenant("n2"))); // must not take V as well
+      await sleep(10);
+      open("n2");
+      await sleep(10);
+      const v = swallow(pool.withConnection(tenant("v"), () => sleep(200))); // V serves a call
+      await sleep(10);
+      const n3 = swallow(use(pool, tenant("n3")));
+      await sleep(10);
+      open("n1");
+      await sleep(10);
+      const n4 = swallow(use(pool, tenant("n4")));
+      await sleep(10);
+      for (const id of ["n3", "n4"]) open(id);
+      await sleep(10);
+      await Promise.all([n1, n2, n3, n4, v]);
+      expect(counter.stats.peak).toBeLessThanOrEqual(3 + 1);
+      await pool.close();
+      expect(counter.stats.alive).toBe(0);
+    });
+
+    /** Seeded PRNG (mulberry32), so a failing run can be replayed. */
+    const seeded = (seed: number) => () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+
+    it.each(Array.from({ length: 12 }, (_, i) => [i + 1, (i % 4) + 1]))("seed %i, max %i: aborts while starting, crashes, idle eviction, overlapping replacements and slow closes never push live processes past max + 1", async (seed, max) => {
+      vi.useFakeTimers();
+      const rand = seeded(seed);
+      const pick = <T>(xs: readonly T[]) => xs[Math.floor(rand() * xs.length)]!;
+      const ids = Array.from({ length: 7 }, (_, i) => `t${i}`);
+      // Every spawn is drawn afresh: quick, slow, slower than the 30 s timeout, or failing.
+      const counter = processCounter(() => ({
+        spawnMs: pick([20, 200, 3_000, 12_000, 31_000]),
+        closeMs: pick([0, 100, 3_000, 6_000]),
+        fails: rand() < 0.15,
+      }));
+      const pool = new UpstreamPool({ toolsInclude: [], spawner: counter.spawner, max, memoryLimitBytes: 2 ** 30, sliceMs: 1_000, idleMs: 6_000 });
+      const calls: Promise<unknown>[] = [];
+      for (let step = 0; step < 300; step++) {
+        const action = rand();
+        if (action < 0.55) {
+          const gone = new AbortController();
+          if (rand() < 0.3) setTimeout(() => gone.abort(), Math.floor(rand() * 5_000)); // the client leaves, maybe while the child starts
+          const hold = Math.floor(rand() * 300);
+          calls.push(pool.withConnection(tenant(pick(ids)), () => sleep(hold), gone.signal).catch(() => undefined));
+        } else if (action < 0.62) {
+          const id = pick(ids);
+          if (pool.keys().includes(credentialKey(tenant(id)))) counter.exitOf(id); // a crash
+        }
+        await vi.advanceTimersByTimeAsync(Math.floor(rand() * rand() * 2_500));
+        expect(counter.stats.peak).toBeLessThanOrEqual(max + 1);
+      }
+      await vi.advanceTimersByTimeAsync(120_000);
+      await Promise.all(calls);
+      const closing = pool.close();
+      await vi.advanceTimersByTimeAsync(120_000);
+      await closing;
+      expect(counter.stats.peak).toBeLessThanOrEqual(max + 1);
+      expect(counter.stats.alive).toBe(0);
+    }, 30_000);
+  });
+
   describe("fairness between tenants", () => {
     const SLICE = 10_000;
     const CALL_MS = 100;

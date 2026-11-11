@@ -22,8 +22,9 @@ import { tmpdir } from "node:os";
  * 1 child at 0.5 Gi (the fleet today, azure/vendor-fleet.bicep `memory`), 2 at
  * 0.75 Gi, 4 at 1 Gi. Live processes are never above max plus the one replacement that
  * starts before an idle child is evicted. A child that has left the pool (replaced, evicted
- * for idleness or crashed) still counts until its close has finished, so nothing starts in
- * its place before it has exited. Beyond that a new credential waits in a short, bounded
+ * for idleness or crashed) still counts until its process has exited (one that was still
+ * starting, until its spawn has ended and its close has finished), so nothing starts in its
+ * place before then. At most one replacement runs at a time. Beyond that a new credential waits in a short, bounded
  * queue and is then refused with PoolBusyError; it never spawns.
  *
  * Fairness: a child serves its tenant freely while nobody else waits. Once another
@@ -32,8 +33,9 @@ import { tmpdir } from "node:os";
  * idle, and the slot passes to the waiters in arrival order. Without this a tenant
  * with a steady stream of calls keeps its child busy for ever and nobody else gets in.
  * If the newcomer's child then fails to start, the incumbent gets a fresh slice before it is
- * asked again, so rotating bad credentials cannot hold a healthy tenant for more than one
- * failed spawn per slice (see `create`).
+ * asked again, so rotating bad credentials cannot hold a healthy incumbent for more than one
+ * failed spawn per slice (see `create`). They can still fill the wait queue and get a
+ * non-incumbent tenant refused, and a valid newcomer waits a slice per bad credential ahead of it.
  */
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -436,6 +438,22 @@ function rejectOnAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T>
   });
 }
 
+/** Resolves when `promise` settles or after `ms`, whichever comes first. Never rejects. */
+function settledWithin(promise: Promise<unknown>, ms: number, onTimeout?: () => void): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      resolve();
+    }, ms);
+    timer.unref();
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    promise.then(done, done);
+  });
+}
+
 export class UpstreamPool {
   private readonly entries = new Map<string, Entry>(); // insertion order == LRU order
   /** Retired children still serving a call; closed when their last call ends (and on shutdown). */
@@ -454,7 +472,7 @@ export class UpstreamPool {
    * toward capacity until the close resolves; see `live`.
    */
   private readonly closingEntries = new Set<Entry>();
-  /** The idle child a starting newcomer is replacing, until that newcomer is up or has failed. */
+  /** The idle child a starting newcomer is replacing, until that newcomer is up or has failed. Claims it: no second replacement starts meanwhile. */
   private replacementVictim: Entry | undefined;
   /** Failed spawns by credential key (insertion order == age), kept for failedSpawnTtlMs. */
   private readonly failedSpawns = new Map<string, { until: number; error: Error }>();
@@ -596,9 +614,10 @@ export class UpstreamPool {
           if (failed) throw failed;
           // Children still closing count as live, so there is only room once they have exited.
           // A full pool of the pool's own children, with nothing closing and no replacement
-          // under way (that would make it max + 1 entries), may replace an idle one.
+          // under way, may replace an idle one. One replacement at a time: it claims its victim
+          // until the newcomer settles, and a second could otherwise claim that victim too.
           const room = this.live < this.max;
-          const full = this.entries.size === this.max && this.closingEntries.size === 0;
+          const full = this.entries.size === this.max && this.closingEntries.size === 0 && !this.replacementVictim;
           const victim = full ? this.leastRecentlyUsedIdle() : undefined;
           if (room || victim) {
             const entry = this.create(key, creds, victim);
@@ -803,33 +822,29 @@ export class UpstreamPool {
   }
 
   /**
-   * Close the entry's child, once. Resolves when it has closed, or after closeTimeoutMs if it
-   * never does. That bound includes a child that is still starting: it is closed whenever it
-   * comes up (or killed by the spawner's own timeout), but nobody waits for it for up to 30 s.
+   * Close the entry's child, once. The child counts toward capacity until its process has
+   * exited: for a child that is still starting that is when its spawn ends (the spawner kills it
+   * at its own timeout, at most SPAWN_TIMEOUT_MS), then its close, which is capped at
+   * closeTimeoutMs so a close that never returns cannot hold a slot for ever. The returned
+   * promise, which shutdown waits on, is capped at closeTimeoutMs in all: a starting child is
+   * closed whenever it comes up, but nobody waits for it for up to 30 s.
    */
   private closeEntry(entry: Entry): Promise<void> {
-    entry.closing ??= (async () => {
+    if (!entry.closing) {
       this.closingEntries.add(entry);
-      let timer: NodeJS.Timeout | undefined;
-      try {
-        await Promise.race([
-          entry.conn.then((conn) => conn.close()),
-          new Promise<void>((resolve) => {
-            timer = setTimeout(() => {
-              logger.warn("Upstream child did not close in time", { poolKey: entry.key.slice(0, 12) });
-              resolve();
-            }, this.closeTimeoutMs);
-            timer.unref();
-          }),
-        ]);
-      } catch {
-        /* spawn failed or already closed */
-      } finally {
-        clearTimeout(timer);
-        this.closingEntries.delete(entry);
-        this.wake(); // there may be room now
-      }
-    })();
+      const exited = entry.conn
+        .then((conn) =>
+          settledWithin(conn.close(), this.closeTimeoutMs, () =>
+            logger.warn("Upstream child did not close in time", { poolKey: entry.key.slice(0, 12) })
+          )
+        )
+        .catch(() => undefined) // spawn failed (its child is already dead) or close threw
+        .finally(() => {
+          this.closingEntries.delete(entry);
+          this.wake(); // there may be room now
+        });
+      entry.closing = settledWithin(exited, this.closeTimeoutMs);
+    }
     return entry.closing;
   }
 
