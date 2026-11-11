@@ -400,6 +400,91 @@ describe("UpstreamPool", () => {
       await expect(next).resolves.toBe("next");
       await pool.close();
     });
+
+    it("applies the same queue cap to callers waiting on a child that is still starting, at once rather than after it is up", async () => {
+      let up!: () => void;
+      const gate = new Promise<void>((r) => (up = r));
+      const spawner: Spawner = async () => {
+        await gate;
+        return { callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined };
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, maxQueue: 1, waitMs: 60_000 });
+      const admitted = Array.from({ length: MAX_CALLS_PER_CHILD + 1 }, () => pool.withConnection(A, async () => "ok")); // the running slot and the one place in the queue
+      await tick();
+      await expect(pool.withConnection(A, async () => "x")).rejects.toBeInstanceOf(PoolBusyError); // while the child is still starting
+      up();
+      await expect(Promise.all(admitted)).resolves.toEqual(["ok", "ok"]);
+      await pool.close();
+    });
+
+    describe("a caller that disconnects never runs its call", () => {
+      it("while the child is still starting: it is rejected at once, not when the child is up, and the claim is released", async () => {
+        let up!: () => void;
+        const gate = new Promise<void>((r) => (up = r));
+        const spawner: Spawner = async () => {
+          await gate;
+          return { callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined };
+        };
+        const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, maxQueue: 1 });
+        const gone = new AbortController();
+        const fn = vi.fn(async () => "ran");
+        const call = pool.withConnection(A, fn, gone.signal);
+        await tick();
+        gone.abort();
+        await expect(call).rejects.toThrow(); // before the child is up
+        up();
+        await tick();
+        expect(fn).not.toHaveBeenCalled();
+        // Nothing is left held: the child takes the next caller, and the queue place is free.
+        await expect(Promise.all([pool.withConnection(A, async () => "a"), pool.withConnection(A, async () => "b")])).resolves.toEqual(["a", "b"]);
+        await pool.close();
+      });
+
+      it("when it aborts before its call can start on a warm child", async () => {
+        const { spawner } = fakeSpawner();
+        const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
+        await use(pool, A);
+        const gone = new AbortController();
+        const fn = vi.fn(async () => "ran");
+        const call = pool.withConnection(A, fn, gone.signal);
+        gone.abort();
+        await expect(call).rejects.toThrow();
+        expect(fn).not.toHaveBeenCalled();
+        await expect(pool.withConnection(A, async () => "next")).resolves.toBe("next"); // the call slot was never taken, or was given back
+        await pool.close();
+      });
+
+      it("when it aborts between getting its call slot and running: the slot is released once", async () => {
+        const { spawner } = fakeSpawner();
+        const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, maxQueue: 0 });
+        await use(pool, A);
+        const gone = new AbortController();
+        const internals = pool as unknown as { enterCall: (...args: unknown[]) => Promise<void> };
+        const enterCall = internals.enterCall.bind(pool);
+        vi.spyOn(internals, "enterCall").mockImplementation(async (...args) => {
+          await enterCall(...args); // the slot is now ours
+          gone.abort(); // and the caller leaves before fn starts
+        });
+        const fn = vi.fn(async () => "ran");
+        await expect(pool.withConnection(A, fn, gone.signal)).rejects.toThrow();
+        expect(fn).not.toHaveBeenCalled();
+        vi.restoreAllMocks();
+        // maxQueue 0: a leaked slot would make this PoolBusyError, a double release would let two calls run at once.
+        let running = 0;
+        let peak = 0;
+        const two = [1, 2].map(() =>
+          pool.withConnection(A, async () => {
+            peak = Math.max(peak, ++running);
+            await tick(5);
+            running--;
+          }).catch((e: unknown) => e)
+        );
+        const results = await Promise.all(two);
+        expect(results.filter((r) => r instanceof PoolBusyError)).toHaveLength(1); // one runs, the other is refused: one slot
+        expect(peak).toBe(1);
+        await pool.close();
+      });
+    });
   });
 
   describe("pool queue and replacement", () => {

@@ -150,6 +150,15 @@ under "Still open" are NOT done and must stay open until they are.
 - `scripts/sustained-load.mjs` now forwards `LOAD_STALL_MS` to the wrapper it
   starts, so `LOAD_STALL_MS=0` really turns the event-loop stall off (the
   wrapper's environment is built from scratch and always ran the default 100).
+- A caller whose request is aborted while the child is still starting, or just
+  before its call would run, is now rejected with the abort and its call never
+  runs (it could be a write tool call); it used to run the call anyway once the
+  child was up. The caller is rejected at once, not when the child comes up, and
+  its child slot and queue place are released once.
+- Callers waiting on a child that is still starting are held to the same
+  per-child cap as callers on a ready one (one running, 8 waiting, then
+  `rate_limited`). The cap was only applied after the child came up, so any
+  number of callers could pile up on a slow start.
 - A child evicted for idleness is counted against the pool's capacity until its
   process has exited, like a replaced child. Before, it left the pool at once
   while its close was still running, so newcomers started beside it: with max 2,

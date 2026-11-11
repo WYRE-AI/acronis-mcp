@@ -419,6 +419,17 @@ function parkInQueue(queue: Waiter[], ms: number, signal?: AbortSignal, key = ""
   });
 }
 
+/** `promise`, or a rejection with the abort reason as soon as `signal` aborts. */
+function rejectOnAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("Request aborted"));
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 export class UpstreamPool {
   private readonly entries = new Map<string, Entry>(); // insertion order == LRU order
   /** Retired children still serving a call; closed when their last call ends (and on shutdown). */
@@ -508,9 +519,10 @@ export class UpstreamPool {
     const key = credentialKey(creds);
     const entry = await this.acquire(key, creds, signal);
     try {
-      const conn = await entry.conn;
+      const conn = await rejectOnAbort(entry.conn, signal);
       await this.enterCall(entry, signal);
       try {
+        signal?.throwIfAborted(); // a caller that has gone must not run fn: it may be a write
         return await fn(conn);
       } finally {
         this.leaveCall(entry);
@@ -528,13 +540,12 @@ export class UpstreamPool {
     }
   }
 
-  /** Take one of the child's call slots, waiting (bounded) if both are taken. */
+  /** Take the child's call slot, waiting if it is taken. `acquire` has already kept the callers of one child to MAX_CALLS_PER_CHILD plus maxQueue. */
   private async enterCall(entry: Entry, signal?: AbortSignal): Promise<void> {
     if (entry.running < MAX_CALLS_PER_CHILD) {
       entry.running++;
       return;
     }
-    if (entry.callWaiters.length >= this.maxQueue) throw new PoolBusyError();
     // Woken means leaveCall handed this caller the slot (running is unchanged).
     if ((await parkInQueue(entry.callWaiters, this.waitMs, signal)) === "timeout") throw new PoolBusyError();
   }
@@ -565,6 +576,8 @@ export class UpstreamPool {
         const existing = this.entries.get(key);
         if (existing) {
           if (!this.mustYield(existing)) {
+            // The cap holds while the child is still starting too: one running, maxQueue waiting.
+            if (existing.inUse >= MAX_CALLS_PER_CHILD + this.maxQueue) throw new PoolBusyError();
             // refresh LRU position
             this.entries.delete(key);
             this.entries.set(key, existing);
