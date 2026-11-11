@@ -299,8 +299,22 @@ How the pool behaves at the ceiling:
   swaps spread the service thinly over all ten (4-8 calls each, 59 in all) and refused 492 calls.
   Neither is usable; more than about three active tenants needs more memory, so **1 Gi is a
   prerequisite for that**, not an optimisation.
+- **Bad credentials cannot starve a healthy tenant.** The negative cache (30 s) is per credential,
+  so a stream of *different* bad credentials gets past it: each one that waits makes the incumbent
+  yield once its slice is over, and the incumbent takes no new calls while the newcomer's spawn is
+  tried. When that spawn fails the incumbent **keeps its child and gets a whole new slice** before
+  another credential may ask it to make way again. So the healthy tenant is held for one failed
+  spawn per slice it serves, and keeps at least `slice / (slice + 8 s)` of its time however many bad
+  credentials rotate: **56% at the default 10 s slice if every bad spawn runs to the 8 s replacement
+  timeout, 87% if each fails after 1.5 s** (and only 11% with the smallest slice, 1 s, which is one
+  more reason not to lower it). Reviewer's probe (ceiling 1, slice 10 s, 30 s wait, 1.5 s bad spawns,
+  32 distinct bad clientIds in 48 s, a healthy tenant calling twice a second): the reviewer measured
+  1 call in 48 s with real children; the same shape on a fake clock, as a test, gave 20 of 96 before
+  and gives 84 of 96 now, the longest gap between two of its calls 2 s.
 - A caller that disconnects (the MCP request's abort signal, tested over real HTTP) leaves every
-  queue at once and frees its place.
+  queue at once and frees its place. This also holds while the child is still starting and just
+  before the call would run: a caller that has gone is rejected and its call (possibly a write) never
+  runs. The per-child queue (one running, 8 waiting) applies to callers waiting on a starting child too.
 - A **failed spawn** (wrong or revoked credentials, no route to the datacenter) is remembered for
   **30 s**, keyed by the credential hash (at most 256 entries), and the same error is returned
   without spawning. After 30 s the next call tries again.

@@ -31,6 +31,9 @@ import { tmpdir } from "node:os";
  * (DEFAULT_POOL_SLICE_MS), it takes no NEW calls; its in-flight calls finish, it goes
  * idle, and the slot passes to the waiters in arrival order. Without this a tenant
  * with a steady stream of calls keeps its child busy for ever and nobody else gets in.
+ * If the newcomer's child then fails to start, the incumbent gets a fresh slice before it is
+ * asked again, so rotating bad credentials cannot hold a healthy tenant for more than one
+ * failed spawn per slice (see `create`).
  */
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -307,8 +310,11 @@ interface Waiter {
 interface Entry {
   key: string;
   conn: Promise<UpstreamConnection>;
-  /** When the child was created; its time slice runs from here. */
-  startedAt: number;
+  /**
+   * When the child's time slice ends: from then on it makes way for a waiting credential, and
+   * (idle) may be replaced. A slice after it was created, or after the last replacement of it failed.
+   */
+  sliceEndsAt: number;
   lastUsed: number;
   /** Callers holding this entry: running a call, or waiting for a call slot. */
   inUse: number;
@@ -633,7 +639,7 @@ export class UpstreamPool {
    */
   private mustYield(entry: Entry): boolean {
     if (this.replacementVictim === entry) return true;
-    if (this.now() - entry.startedAt < this.sliceMs) return false;
+    if (this.now() < entry.sliceEndsAt) return false;
     return [...this.waitingFor.keys()].some((k) => k !== entry.key);
   }
 
@@ -676,7 +682,7 @@ export class UpstreamPool {
    * however briefly its tenant pauses; its waiters are woken when it has aged.
    */
   private leastRecentlyUsedIdle(): Entry | undefined {
-    return [...this.entries.values()].find((e) => e.inUse === 0 && this.now() - e.startedAt >= this.sliceMs);
+    return [...this.entries.values()].find((e) => e.inUse === 0 && this.now() >= e.sliceEndsAt);
   }
 
   /**
@@ -688,7 +694,7 @@ export class UpstreamPool {
     if (this.agingTimer) return;
     const waits = [...this.entries.values()]
       .filter((e) => e.inUse === 0)
-      .map((e) => e.startedAt + this.sliceMs - this.now())
+      .map((e) => e.sliceEndsAt - this.now())
       .filter((ms) => ms > 0);
     if (!waits.length) return;
     this.agingTimer = setTimeout(() => {
@@ -711,11 +717,19 @@ export class UpstreamPool {
    * newcomer, so the victim is still idle when the newcomer is up. So the pool is
    * never above max children plus this one replacement: the victim keeps counting
    * as live until it has exited (see `live`), and nothing else starts before that.
+   *
+   * If the spawn fails the victim stays, and gets a whole new slice (sliceEndsAt)
+   * before it may be asked to make way again. That bounds what a stream of distinct
+   * bad credentials, which the per-credential negative cache does not stop, can take
+   * from a healthy tenant: it is held for one failed spawn (REPLACEMENT_SPAWN_TIMEOUT_MS
+   * at the very most) per slice it serves, so it keeps at least
+   * sliceMs / (sliceMs + REPLACEMENT_SPAWN_TIMEOUT_MS) of its time: 56% at the default
+   * 10 s slice if every bad spawn runs to its timeout, 87% if each fails after 1.5 s.
    */
   private create(key: string, creds: AcronisCredentials, victim?: Entry): Entry {
     const entry: Entry = {
       key,
-      startedAt: this.now(),
+      sliceEndsAt: this.now() + this.sliceMs,
       lastUsed: this.now(),
       inUse: 0,
       running: 0,
@@ -734,6 +748,9 @@ export class UpstreamPool {
         this.drop(entry);
         // Remember a failed spawn briefly so a bad credential cannot respawn on every call.
         this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
+        // The victim sat out this attempt for nothing. It serves a whole slice before another
+        // credential may ask it to make way again (see mustYield).
+        if (victim) victim.sliceEndsAt = this.now() + this.sliceMs;
       })
       .finally(() => {
         if (!victim) return;

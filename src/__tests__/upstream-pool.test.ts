@@ -818,6 +818,47 @@ describe("UpstreamPool", () => {
       await pool.close();
     });
 
+    it("distinct bad credentials cannot starve a healthy tenant: after a failed replacement it keeps its child for a whole slice (the reviewer's probe: max 1, slice 10 s, wait 30 s, 1.5 s bad spawns, 32 of them in 48 s)", async () => {
+      vi.useFakeTimers();
+      const BAD_SPAWN_MS = 1_500;
+      const spawner: Spawner = async (creds) => {
+        if (creds.clientId.startsWith("bad")) {
+          await sleep(BAD_SPAWN_MS);
+          throw new Error("invalid_client");
+        }
+        return { callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined };
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: SLICE, waitMs: 30_000 });
+      const end = Date.now() + 48_000;
+      // A healthy tenant calling twice a second: 96 calls if nothing ever gets in its way.
+      let ok = 0;
+      let lastOk = Date.now();
+      let longestGap = 0;
+      void (async () => {
+        while (Date.now() < end) {
+          try {
+            await pool.withConnection(A, () => sleep(100));
+            ok++;
+            longestGap = Math.max(longestGap, Date.now() - lastOk);
+            lastOk = Date.now();
+          } catch (e) {
+            if (!(e instanceof PoolBusyError)) throw e;
+          }
+          await sleep(400);
+        }
+      })();
+      for (let i = 0; i < 32; i++) {
+        void use(pool, { ...B, clientId: `bad${i}` }).catch(() => undefined); // each a new credential, so the 30 s negative cache never applies
+        await vi.advanceTimersByTimeAsync(1_500);
+      }
+      await vi.advanceTimersByTimeAsync(2_000);
+      // The bound: the tenant is held for at most one failed spawn (1.5 s) per slice (10 s) it has served, so it keeps at
+      // least 10 / 11.5 = 87% of its calls, and never waits longer than a spawn plus a call and a pause. Before: 1 call in 48 s.
+      expect(ok).toBeGreaterThanOrEqual(75);
+      expect(longestGap).toBeLessThanOrEqual(BAD_SPAWN_MS + 100 + 400 + 500);
+      await pool.close();
+    });
+
     it("keeps the fast path when nobody waits: a lone tenant is never asked to make way, however long it runs", async () => {
       vi.useFakeTimers();
       const { spawner, started } = recordingSpawner();

@@ -150,6 +150,18 @@ under "Still open" are NOT done and must stay open until they are.
 - `scripts/sustained-load.mjs` now forwards `LOAD_STALL_MS` to the wrapper it
   starts, so `LOAD_STALL_MS=0` really turns the event-loop stall off (the
   wrapper's environment is built from scratch and always ran the default 100).
+- Distinct bad credentials can no longer starve a healthy tenant. The per-key
+  negative cache does not stop a stream of different bad credentials, and each
+  waiting one made the incumbent yield and block its own callers for the whole
+  failing spawn, again as soon as the next one queued (reviewer's probe: max 1,
+  slice 10 s, wait 30 s, 1.5 s bad spawns, 32 distinct clientIds: a tenant doing
+  23 calls per 12 s dropped to 1 call in 48 s). Now, when a replacement spawn
+  fails, the incumbent keeps its child and gets a whole new slice before it can be
+  asked to make way again. A healthy tenant is held for one failed spawn per slice
+  it serves, so it keeps at least slice / (slice + 8 s) of its time: 56% at the
+  default 10 s slice if every bad spawn runs to its 8 s timeout, 87% for 1.5 s
+  failures (only 11% at the 1 s minimum slice). The same probe shape as a test
+  on a fake clock: 20 of 96 calls before, 84 now, longest gap 2 s.
 - A caller whose request is aborted while the child is still starting, or just
   before its call would run, is now rejected with the abort and its call never
   runs (it could be a write tool call); it used to run the call anyway once the
