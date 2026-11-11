@@ -21,9 +21,11 @@
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:load": "vitest run --config vitest.load.config.ts",
     "test:watch": "vitest",
     "smoke": "node scripts/smoke-dual-era.mjs",
-    "gen-tools": "node scripts/gen-tools.mjs"
+    "gen-tools": "node scripts/gen-tools.mjs",
+    "verify-upstream": "node scripts/verify-upstream.mjs"
   },
   "repository": {
     "type": "git",

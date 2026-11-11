@@ -7,6 +7,12 @@ describe("validateBaseUrl (SSRF guard)", () => {
     ["https://US5-Cloud.Acronis.com/", "https://us5-cloud.acronis.com"],
     ["https://mc-beta-cloud.acronis.com:443", "https://mc-beta-cloud.acronis.com"],
     ["  https://eu2-cloud.acronis.com  ", "https://eu2-cloud.acronis.com"],
+    ["https://eu8-cloud.acronis.com", "https://eu8-cloud.acronis.com"],
+    ["https://cloud.acronis.com", "https://cloud.acronis.com"],
+    ["https://a.acronis.com", "https://a.acronis.com"],
+    // URL parsing lowercases the host, so these are the same host, stored lowercase.
+    ["https://EU8-Cloud.ACRONIS.com", "https://eu8-cloud.acronis.com"],
+    [`https://${"a".repeat(63)}.acronis.com`, `https://${"a".repeat(63)}.acronis.com`],
   ])("accepts %s", (input, expected) => {
     expect(validateBaseUrl(input)).toEqual({ url: expected });
   });
@@ -35,6 +41,35 @@ describe("validateBaseUrl (SSRF guard)", () => {
     "https://[::1]",
     "https://169.254.169.254",
     "https://us5-cloud.acronis.com.",
+    // WYREAI-711: exactly one label under acronis.com (Conduit's rule).
+    "https://a.b.acronis.com",
+    "https://user-content.files.acronis.com",
+    "https://eu8-cloud.eu.acronis.com",
+    "https://ACRONIS.COM",
+    "https://acronis.com.",
+    "https://eu8-cloud.acronis.com.",
+    "https://.acronis.com",
+    "https://..acronis.com",
+    "https://-a.acronis.com",
+    "https://a-.acronis.com",
+    "https://a_b.acronis.com",
+    `https://${"a".repeat(64)}.acronis.com`,
+    "https://EU8-CLOUD.ACRONIS.COM.EVIL.COM",
+    "https://eu8-cloud.acronis.com%2eevil.com",
+    "https://eu8-cloud.acronis.com:443@evil.com",
+    "https://evil.com\\.acronis.com",
+    "https://eu8-cloud.acronis.com\\@evil.com",
+    "https://eu8-cloud.acronis.com:80",
+    "https://eu8-cloud.acronis.com:0",
+    // IDN / punycode look-alikes of acronis.com resolve to xn-- hosts that are not under it.
+    "https://аcronis.com", // Cyrillic a
+    "https://eu8-cloud.аcronis.com",
+    "https://xn--cronis-2nf.com",
+    "https://eu8-cloud.xn--cronis-2nf.com",
+    "https://ⓐcronis.com", // normalises to the apex acronis.com
+    "https://eu8-cloud.acronis.com.xn--evil-7ia.com",
+    "https://evil-acronis.com",
+    "https://notacronis.com",
   ])("rejects %j", (input) => {
     const r = validateBaseUrl(input);
     expect(r.url).toBeUndefined();

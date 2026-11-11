@@ -37,6 +37,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      - name: Verify upstream pin (version, integrity, file sha256)
+        run: npm run verify-upstream
+
       - name: Run linter
         run: npm run lint
 
@@ -49,8 +52,26 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # WYREAI-711: the pool is sized from measured peaks. Runs alone, after the
+      # other tests, so it has the CPU to itself, and prints the numbers.
+      - name: Sustained-load memory check
+        run: npm run test:load
+
       - name: Test Docker build
         run: docker build -t acronis-mcp:test .
+
+      # WYREAI-711: the app user (which the upstream children also run as) must
+      # not be able to rewrite the pinned bundle, the egress guard or the wrapper.
+      - name: Image is read-only for the app user
+        run: |
+          docker run --rm --entrypoint sh acronis-mcp:test -c '
+            test "$(id -u)" != 0 || { echo "runs as root"; exit 1; }
+            test -r /app/child-egress-guard.cjs || { echo "guard not readable"; exit 1; }
+            for f in /app/child-egress-guard.cjs /app/dist/index.js /app/node_modules/@acronis-platform/mcp/bin/cli.js /app/node_modules/@acronis-platform/mcp/dist/bundle.js; do
+              if ( : >> "$f" ) 2>/dev/null; then echo "writable: $f"; exit 1; fi
+            done
+            if touch /app/new-file 2>/dev/null; then echo "/app is writable"; exit 1; fi
+            echo "read-only as expected"'
 
   code-quality:
     name: Code Quality
@@ -70,6 +91,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
+
+      - name: Verify upstream pin (version, integrity, file sha256)
+        run: npm run verify-upstream
 
       - name: Run linter
         run: npm run lint

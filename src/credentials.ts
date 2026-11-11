@@ -22,12 +22,23 @@ export const GATEWAY_HEADERS = [
   "X-Acronis-Client-Secret",
 ] as const;
 
-const ALLOWED_HOST_SUFFIX = ".acronis.com";
 const MAX_CRED_LENGTH = 512;
 
 /**
- * SSRF guard (WYREAI-454): https only, hostname must be a strict subdomain of
- * acronis.com, no userinfo, default port only, no path/query/fragment.
+ * EXACTLY one DNS label under acronis.com (us5-cloud, eu8-cloud, ...), the same
+ * rule as Conduit's `acronisOrigin` (conduit src/credentials/vendor-config.ts).
+ * A deeper name (user-content.files.acronis.com) could be user content or a
+ * takeover-prone host, and it would receive the client_secret. The label must
+ * be a valid DNS label (no leading or trailing hyphen, at most 63 characters).
+ * Tested against URL.hostname, which is already lowercased, punycoded (IDN
+ * look-alikes become xn-- names that are not under acronis.com) and keeps a
+ * trailing dot, so `acronis.com.` and `a.acronis.com.` fail.
+ */
+const ALLOWED_HOST = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.acronis\.com$/;
+
+/**
+ * SSRF guard (WYREAI-454, WYREAI-711): https only, hostname exactly one label
+ * under acronis.com, no userinfo, default port only, no path/query/fragment.
  * Returns the normalised origin.
  */
 export function validateBaseUrl(raw: string | undefined): { url?: string; error?: string } {
@@ -49,11 +60,10 @@ export function validateBaseUrl(raw: string | undefined): { url?: string; error?
   if ((parsed.pathname !== "/" && parsed.pathname !== "") || parsed.search || parsed.hash) {
     return { error: "The Acronis Data center URL must be just the address, such as https://us5-cloud.acronis.com, with nothing after .com. Reconnect Acronis in Conduit with that address." };
   }
-  const host = parsed.hostname.toLowerCase();
-  if (!host.endsWith(ALLOWED_HOST_SUFFIX) || host.length === ALLOWED_HOST_SUFFIX.length) {
-    return { error: `Acronis base URL hostname must end with ${ALLOWED_HOST_SUFFIX}` };
+  if (!ALLOWED_HOST.test(parsed.hostname)) {
+    return { error: "Acronis base URL hostname must be exactly one label under acronis.com, such as us5-cloud.acronis.com" };
   }
-  return { url: `https://${host}` };
+  return { url: `https://${parsed.hostname}` };
 }
 
 export function buildCredentials(

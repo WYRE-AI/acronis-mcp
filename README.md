@@ -15,14 +15,109 @@ starting any child process. Only `tools/call` starts an upstream child.
 
 ## Upstream pinning policy
 
-`@acronis-platform/mcp` is pinned to an **exact** version in `package.json` (no `^`/`~`; a test
-enforces `1.0.1`). Bumps happen **by pull request only**. Renovate/Dependabot may propose one, but it
-must not auto-merge: a bump needs a human to
+`@acronis-platform/mcp` has no source repository and no provenance, and it ships as one esbuild
+bundle that dependency scanners cannot see into. So it is pinned byte for byte
+(`scripts/upstream-pin.json`):
 
-1. diff the upstream `tools/list` against `research/upstream-tools-1.0.1.json` (new, renamed or
+- the **exact** version in `package.json` (no `^`/`~`),
+- the tarball **integrity** (sha512) in `package-lock.json`, which `npm ci` enforces, and
+- the **sha256 of every file the package can run**: all of `bin/` and `dist/` (`bin/cli.js`, which
+  is what the pool executes, and `dist/bundle.js`). A file added or removed there fails the check
+  too, and so does any **symlink** under `bin/` or `dist/` (a pinned file replaced by a link to
+  identical content would otherwise pass the hash).
+
+**Not covered by the file hashes:** the upstream's own dependencies, under
+`node_modules/@acronis-platform/mcp/node_modules` (today `supports-color`). They are covered only
+by the lockfile integrity (`npm ci` checks every tarball) and by the read-only `/app` in the image.
+
+`npm run verify-upstream` (`scripts/verify-upstream.mjs`) checks all of it. It runs in both CI jobs
+and in the Dockerfile after `npm prune`, so it checks the `node_modules` that ships; a mismatch
+**fails the image build**.
+
+Bumps happen **by pull request only, and a human reviews them**. Dependabot is told to ignore the
+package (`.github/dependabot.yml`), so no bump PR exists for it. That is the whole of the repo-side
+control: see "Required maintainer actions" below for what a file cannot enforce. A bump needs a
+human to
+
+1. diff the new bundle against the old one (beautify both and compare, or at least the outbound
+   `fetch`/`http` call sites, the token flow and anything touching `process.env` or the filesystem),
+2. diff the upstream `tools/list` against `research/upstream-tools-1.0.1.json` (new, renamed or
    duplicated tools),
-2. regenerate `src/generated/tools.ts` with `npm run gen-tools`,
-3. re-review `research/tiers.json` and the integration test.
+3. regenerate `src/generated/tools.ts` with `npm run gen-tools`,
+4. re-review `research/tiers.json` and the integration test,
+5. update `scripts/upstream-pin.json` (version, `tarballIntegrity` from `npm view <pkg>@<version>
+   dist.integrity`, and the sha256 of each file in `files` from `shasum -a 256`).
+
+### Required maintainer actions (repository and organization settings)
+
+`.github/CODEOWNERS` names the owners of the pin, lockfile, Dockerfile, egress guard, pool,
+credential and sanitising code, and CI. **None of that is enforced today.** These are settings a
+repository admin has to change; nothing in this repo can:
+
+1. **Enable "Require review from Code Owners"** in the branch protection rule on `main`
+   (`require_code_owner_reviews` is `false` now).
+2. **Require the status checks** `Test on Node.js 22.x`, `Test on Node.js 24.x` and `Code Quality`
+   on `main` (none are required now), so the pin check and the image build cannot be skipped.
+3. **Exclude `/Dockerfile` and `/.github` from the org's `dependabot-janitor`.** It auto-merges
+   green grouped Dependabot PRs, and the `github-actions` and `docker` groups change exactly those
+   two paths, which hold the pin check, the guard copy and the image hardening. With 1 and 2 off,
+   such a PR can change them with no human review.
+
+Until these are done, a bot can merge a change to the pin check or the Dockerfile unreviewed.
+
+### Egress (what the code does and what it cannot)
+
+The code confines what it can. This is **defence in depth, not a sandbox**:
+
+- The base URL is validated to exactly one label under `acronis.com` (see Credentials).
+- Every child preloads `child-egress-guard.cjs`. Its `fetch` may reach only the origin of its own
+  `API_BASE_URL`, and it passes `redirect: "error"`, so a 307/308 from the token endpoint cannot
+  replay the `client_secret` to another host. It reads the request URL **once**, as a string (a
+  `URL` through the prototype `href` getter, a `Request` through the prototype `url` getter), and
+  forwards that same string, so neither an object whose `toString()` names another URL, nor a `URL`
+  or `Request` subclass, nor a getter that answers differently the second time can pass the check
+  and then request another host.
+- The same guard aborts a response body over **256 KiB** while it streams, before the bundle
+  buffers and parses it (see "Pool sizing").
+
+**Regression risk, untested against a real tenant:** `redirect: "error"` means any 3xx from Acronis,
+for the token endpoint or an API call, now fails the call instead of being followed. Likewise a
+response over 256 KiB now fails. Both were tested only against local fakes; neither has been run
+against a real Acronis tenant, and a datacenter that redirects legitimately would show up as
+`upstream_unavailable`.
+
+**An oversize response is an error, never a partial list.** The cap is on the raw HTTP body, before
+the bundle parses it, so there is no valid prefix to return, and a cut-off list that looks complete
+("these are all the alerts") is worse than an error. The wrapper turns it into
+`{"error":{"code":"response_too_large",...}}` (recognised only when the first text block of the error is
+exactly the guard's `HTTP request failed: Acronis response is larger than N bytes and was not read`; an
+upstream 400 whose body quotes that text is passed through as the real error, tested with a real child)
+whose message says it is not an empty result and names the
+tool's own narrowing parameters, read from its input schema (`query.limit` and `query.after` to page,
+`query.tenant`, `query.tenant_id` or `query.customer_id` to scope, filters such as `query.severity`).
+Only 12 of the 34 read tools take `limit`. The two with nothing to narrow by,
+`acronis_fetch_tenant_users` and `acronis_fetch_tenant_children`, point to
+`acronis_fetch_users_batch` and `acronis_fetch_tenants_batch`, which do. A large organization can
+still hit the cap on a tool such as `acronis_fetch_tenant_usages`.
+
+The guard covers the global `fetch` only. A hostile bundle can still open raw sockets, read files,
+and read its siblings' `/proc/<pid>/environ`.
+
+**Restricting the container's outbound traffic to `*.acronis.com` cannot be done from inside the
+container or from this repo, and has not been done.** Azure Container Apps gives the container
+unrestricted egress by default. It needs an infrastructure change in the Conduit fleet
+(`azure/vendor-fleet.bicep` and its environment): a VNet-integrated environment whose outbound
+traffic goes through a user-defined route to an FQDN-filtering firewall (for example Azure Firewall)
+with an application rule that allows only `*.acronis.com` on 443. Not verified.
+
+**Also not solved (open):** all children run as the same uid as the wrapper. A hostile bundle could
+read the other children's `/proc/<pid>/environ` **and the wrapper's own environment, which includes
+`CONDUIT_S2S_SECRET`** (the child's environment is built from scratch, but `/proc/<ppid>/environ` is
+readable by the same uid). Per-child uids or a hardened `/proc` need container or platform changes.
+The pin, the guard, the read-only `/app` (the Dockerfile keeps `/app` root-owned so a child cannot
+rewrite the bundle, the guard or the wrapper) and the review above reduce that risk; they do not
+remove it. Mirroring or vendoring the tarball (protection against the version being unpublished) is
+also not done.
 
 Upstream 1.0.1 ships three duplicated tool names (`device_authorization_approval`,
 `fetch_registration_tokens`, `create_registration_token`); none are allowlisted, and the generator
@@ -43,8 +138,214 @@ So `src/upstream-pool.ts` spawns **one child per distinct credential tuple**
   `OAUTH_CLIENT_SECRET`, `MCP_TRANSPORT=stdio`, `MCP_TOOLS_INCLUDE=<allowlist for enabled tiers>`.
   (The MCP client SDK additionally adds its own non-secret defaults: `HOME`, `LOGNAME`, `SHELL`,
   `TERM`, `USER`.)
-- LRU limit `ACRONIS_POOL_MAX` (default 50), idle TTL `ACRONIS_POOL_IDLE_MS` (default 10 min), and
-  every child is closed on shutdown. An evicted child that is mid-call is closed when the call ends.
+- Every child runs with `--max-old-space-size=80 --max-semi-space-size=1` and preloads
+  `child-egress-guard.cjs` (see "Egress" and "Pool sizing"). **One** call runs in a child at a time.
+- Idle TTL `ACRONIS_POOL_IDLE_MS` (default 10 min), and every child is closed on shutdown. An
+  evicted child that is mid-call is closed when the call ends.
+
+### Pool sizing and failure modes
+
+Memory is the limit, and what counts is the **peak under sustained load** of the wrapper and of
+every child together, not idle sizes and not a one-shot call. (An earlier version of this section
+sized the pool from one-shot figures; a review showed that overshot by about 25%.)
+
+`npm run build && node scripts/sustained-load.mjs` measures it: the real built wrapper as its own
+process with the flags from the Dockerfile `CMD`, a real HTTP server, the real pool, real upstream
+children and the real egress guard, against a fake Acronis that answers with realistic JSON lists at
+the response cap. Several callers on several tenants run for 6 s while the wrapper's event loop is
+stalled for 100 ms every 250 ms (a 0.25 vCPU container does this under load), and the RSS of the
+wrapper and of each child is sampled every 20 ms. `npm run test:load`
+(`src/__tests__/sustained-load.test.ts`; CI runs it after the other tests, and it is not part of
+`npm test` because it needs the CPU to itself) runs it as a regression test and fails above the
+container size or on any crashed child (set `ACRONIS_SKIP_LOAD_TEST=1` to skip it).
+
+**The table below is macOS with Node 26. The Linux CI job (Ubuntu, not the alpine image and not under
+`docker run -m`) prints the same measurement: on Node 24 the wrapper peaked at 123-128 MiB and a
+child at 139-141 MiB, with a total of 349-350 MiB at 0.5 Gi (budget 512) and 659 MiB at 1 Gi
+(budget 1024); Node 22 is lower (wrapper 98-103, child 123-133, 310-313 and 610 MiB). The constants
+in `src/upstream-pool.ts` follow the largest of these: `CHILD_PEAK_MB` 145, `WRAPPER_PEAK_MB` 140
+(the wrapper is lower on Linux; it was not lowered). Nobody working on this had Docker, so nothing
+here is measured in the image.** Before trusting a size, run the image under the real limit
+(`docker run -m 512m ...`) and re-run the script there; adjust `WRAPPER_PEAK_MB`, `CHILD_PEAK_MB` and
+`CHILD_STARTUP_MB` to what it shows.
+
+| Sustained load, 2 tenants, 6 callers, 6 s | Before | Now |
+|---|---|---|
+| Wrapper | no heap cap; idle 121, **peak 298-302 MiB** | `--max-old-space-size=64 --max-semi-space-size=1`; idle 83, peak 117-120 MiB |
+| One child | 480 KiB responses, 2 calls at once; idle 130, **peak 198-200 MiB** | 250 KiB responses, 1 call at a time, `--max-semi-space-size=1`; idle 113, peak 121-124 MiB |
+| Children at 0.5 Gi | 2 | 1 |
+| **Total RSS, peak** | **691-692 MiB** (budget 512; the pool believed about 480) | **330-338 MiB** (budget 512) |
+
+At 1 Gi with 4 tenants and 8 callers the total peaked at 627-628 MiB on macOS (wrapper 134-140, a
+child 123-125) and 659 MiB on Linux with Node 24. Two children plus a third starting (what 0.5 Gi
+would allow at 2) peaked at 483 MiB on macOS: it fits, but leaves no 15% margin, which is why 0.5 Gi
+gets 1.
+
+A child is bounded these ways:
+
+- **Heap cap:** it runs with `--max-old-space-size=80`. A child that exhausts its heap dies alone;
+  the pool drops it and respawns on the tenant's next call (tested with the real child). With one
+  call at a time and responses of at most 256 KiB, a child ran cleanly under the stalled load at
+  32 MiB, ran at about 60% of the throughput at 24 MiB and would not start at 16 MiB, so 80 leaves
+  2.5x. (With two calls at once and 480 KiB responses the old 80 MiB heap was marginal: the review
+  saw V8 "Ineffective mark-compacts" crashes when the wrapper's event loop stalled.) It caps the V8
+  heap only; the response cap keeps native and external memory small.
+- **Response cap:** the egress guard aborts any upstream response body over **256 KiB** while it
+  streams (or at once, if `Content-Length` says so), before the bundle buffers and parses it. The
+  call fails with `response_too_large` (see "Egress" for what the model is told, and for the
+  risk that this is untested against a real tenant). 256 KiB is a judgement, not a measurement of
+  real Acronis list sizes.
+- **In-flight cap:** **one** call runs in a child at a time. More wait in a per-child queue of at
+  most **8** callers for up to **30 s**, then get `rate_limited`. So **one tenant can have at most
+  9 calls in flight or waiting: the 10th at the same moment is refused at once with `rate_limited`**,
+  and a queued call that waits 30 s (nine slow Acronis calls in a row will) gets it too.
+- **Spawn timeout:** a child that has not answered `initialize` (it fetches its token first) within
+  **30 s** is killed; a child that **replaces** an idle one (the pool is full) within **8 s**, because
+  the idle child takes no new calls until the replacement is up, so a slow or tarpitted newcomer must
+  not hold a healthy tenant for 30 s. A replacement that times out is remembered as a failed spawn
+  (below), so a bad credential cannot repeat it.
+
+The ceiling on children is derived from the container's memory limit (`process.constrainedMemory()`,
+which reads the cgroup limit; 0, unknown or "unlimited" falls back to 512 MiB, i.e. 1 child).
+`ACRONIS_MEMORY_LIMIT_MB` can only **lower** it: it is capped at the limit Node reads, and ignored
+(with a warning) when Node cannot read one, so a wrong value cannot size the pool past the
+container:
+
+    children = clamp(floor((limit / 1.15 - 140 wrapper peak - 115 one child starting) / 145 peak per child), 1, 4)
+
+| Container memory | Children |
+|---|---|
+| 0.5 Gi (the fleet today, `azure/vendor-fleet.bicep`) | **1** (190 MiB left for children: 1.3, floored) |
+| 0.75 Gi | 2 (was 3 with the macOS child peak of 130) |
+| 1 Gi or more | **4** (hard ceiling; 4.4 before the clamp) |
+
+The 15% margin is applied to the whole sum, and the "one child starting" is the replacement the pool
+starts before it evicts an idle child (below). `ACRONIS_POOL_MAX` can only lower the ceiling (a higher
+value is clamped and logged). At startup the pool logs one line, `Upstream pool`, with the memory
+limit it found (or `unknown (assuming 512)`), the derived ceiling, the effective maximum and the time
+slice, so an operator can see why a 1 Gi container runs one child (Node could not read the limit:
+`constrainedMemory()` is 0, and `ACRONIS_MEMORY_LIMIT_MB` cannot raise it).
+
+**What 1 child at 0.5 Gi means in practice: very few concurrent tenants.** A second tenant that calls
+while the first is mid-call waits for its turn (below), up to 30 s, and is then refused with
+`rate_limited`. Every change of tenant is a cold start (a spawn plus a token fetch, slow at 0.25
+vCPU). Two tenants that are both busy therefore **share one child, taking turns of 10 s**:
+measured with 2 tenants x 3 callers for 45 s (macOS, Node 26), tenant 0 completed 267 calls and
+tenant 1 223, none refused, the longest call 11.3 s (a slice plus a start). **Recommendation: raise
+the container to 1 Gi** (4 children; no `rate_limited` in the 4-tenant run above). That is a Conduit
+infrastructure change (`azure/vendor-fleet.bicep`), not part of this repository or this change.
+
+How the pool behaves at the ceiling:
+
+- A new credential that finds an **idle** child in a full pool spawns its child first, and the idle
+  child (LRU) is closed only when the new one is up, so a stream of bad credentials cannot flush
+  healthy tenants' children. From the moment that spawn starts the idle child takes no new calls: its
+  tenant queues behind the newcomer. **The replacement lasts until the old child has exited**, not
+  only until the new one is up, so there are never more than **max + 1** children alive (the +1 is
+  that replacement, and at most one runs at a time: the idle child it replaces is claimed until the
+  newcomer is up or has failed, and no second replacement may start before then). A child that leaves the pool any other way
+  (evicted for idleness, or crashed) counts as alive until its close has finished too, so no child
+  starts in its place before it has exited. The close escalates (stdin EOF, 2 s, SIGTERM,
+  2 s, SIGKILL; tested with a real child that ignores both) and the pool stops counting a close that
+  never returns after 8 s, so one stuck child cannot hold up every later replacement. A child that
+  leaves the pool **while it is still starting** (its caller disconnected, then it was replaced) counts
+  until its spawn has ended, at most the 30 s spawn timeout, and then its close; shutdown never waits
+  more than 8 s for it. A newcomer whose spawn **fails or
+  times out** has its child killed (SIGKILL) and the spawner waits for the process to really exit
+  before it reports the failure, so the replacement slot is not released while that child is still
+  dying (the SDK closes the transport itself on a connect timeout and a later close returns at
+  once). Tested with a counting spawner (30 distinct newcomers at max 2 with a slow-closing child:
+  peak 3), under churn, and with real children: a hung replacement spawn with a newcomer queued
+  behind it never has more than max + 1 live processes (3 before the kill-and-wait).
+- If every child is busy, or a replacement is starting, the caller waits in a queue of at most **8**
+  callers, **at most 3 of them for one credential** (so one tenant's parallel callers cannot fill the
+  queue and have every other tenant refused at once; a fourth caller of the same tenant is refused
+  at once), for up to **30 s**, then is refused at once with
+  `{"error":{"code":"rate_limited",...}}` (the 429 case). It never spawns an extra child.
+- **Minimum residency.** An idle child is replaced only once it has been up for a time slice (10 s),
+  so a slot is respawned at most about once per slice, however briefly its tenant pauses between
+  calls. Before, any idle child was replaced the moment another credential waited, so tenants that
+  paused for a moment between calls swapped the child back and forth, each swap a cold start (a
+  token fetch and about 115 MiB, slow at 0.25 vCPU). Waiters wait for the child to age, or for
+  another to free up. One timer for the pool wakes them when it has aged, in the order they
+  arrived, so they are served in arrival order (a timer per waiter resumed them in timer order,
+  which was out of order in 20 of 300 runs of a 5-waiter test under CPU load).
+- **Turns.** A child serves its tenant without limit while nobody else waits (the fast path is
+  unchanged). Once a different credential is waiting and the child has held its slot for a **time
+  slice (10 s, `ACRONIS_POOL_SLICE_MS`)**, it takes no new calls: the calls already in flight or
+  queued in it finish (a call is never cut off), the child goes idle, and the slot passes to the
+  waiters in the order they arrived. The tenant's later calls queue behind the waiter, and get the
+  slot back after that tenant's own slice. Without this a tenant with a steady stream of calls kept
+  its child busy for ever: before this change, 2 tenants x 3 callers on one child for 45 s gave
+  tenant 1 607 calls and tenant 0 **3** (6 `rate_limited`, longest wait 30.1 s). A waiter is served
+  within about one slice plus the calls in flight, which is why the slice is a third of the 30 s a
+  caller waits. With more tenants than children the wait is several slices, so more than about
+  three tenants per child will see `rate_limited`: that is the capacity limit, and the answer is memory.
+  `ACRONIS_POOL_SLICE_MS` is clamped to between 1 s (a smaller slice is a respawn per call) and 15 s,
+  half the 30 s wait (a longer one means a waiter times out before the child makes way).
+
+  **Measured churn** (0.5 Gi, ceiling 1, real children, 2 tenants x 3 callers, 30 s, macOS, Node 26;
+  `scripts/sustained-load.mjs` does not take a think time, so these runs used a copy of the reviewer's
+  harness with a pause between each caller's calls):
+
+  | Case | Spawns per minute, before -> after | Calls completed, before -> after | `rate_limited`, before -> after |
+  |---|---|---|---|
+  | back to back | 38.4 -> 7.9 | 204 -> 1171 | 0 -> 0 |
+  | 500 ms pause between calls | 20.3 -> 7.8 | 74 -> 175 | 0 -> 0 |
+  | 2 s pause | 26.7 -> 7.4 | 45 -> 48 | 0 -> 0 |
+  | 10 tenants x 2 callers, 500 ms pause | 28.9 -> 7.4 | 59 -> 117 | 492 -> 587 |
+
+  The reviewer measured higher churn before (157 spawns per minute at a 500 ms pause) than this
+  repeat of the same shape did (20); the harness settings may differ. After, every case is at about
+  one spawn per slice (6 per minute plus the start). **The last row is the honest cost:** with 10
+  tenants on one child, three tenants are served in 30 s (one per 10 s slice) and the rest wait out
+  the 30 s and get `rate_limited` (six of ten tenants got no call in 30 s). Before, the idle-child
+  swaps spread the service thinly over all ten (4-8 calls each, 59 in all) and refused 492 calls.
+  Neither is usable; more than about three active tenants needs more memory, so **1 Gi is a
+  prerequisite for that**, not an optimisation.
+- **Bad credentials cannot starve the incumbent tenant** (see the limitations below for what they
+  can still do to others). The negative cache (30 s) is per credential,
+  so a stream of *different* bad credentials gets past it: each one that waits makes the incumbent
+  yield once its slice is over, and the incumbent takes no new calls while the newcomer's spawn is
+  tried. When that spawn fails the incumbent **keeps its child and gets a whole new slice** before
+  another credential may ask it to make way again. So the incumbent, if healthy, is held for one failed
+  spawn per slice it serves, and keeps at least `slice / (slice + 8 s)` of its time however many bad
+  credentials rotate: **56% at the default 10 s slice if every bad spawn runs to the 8 s replacement
+  timeout, 87% if each fails after 1.5 s** (and only 11% with the smallest slice, 1 s, which is one
+  more reason not to lower it). Reviewer's probe (ceiling 1, slice 10 s, 30 s wait, 1.5 s bad spawns,
+  32 distinct bad clientIds in 48 s, a healthy tenant calling twice a second): the reviewer measured
+  1 call in 48 s with real children; the same shape on a fake clock, as a test, gave 20 of 96 before
+  and gives 84 of 96 now, the longest gap between two of its calls 2 s.
+
+  **Known limitations of this queueing (not changed here).**
+  - *A non-incumbent can still be starved.* The guarantee above is for the tenant that already holds
+    the child. With two healthy tenants and a stream of distinct bad credentials, the bad ones keep
+    the 8-place queue full, and a healthy tenant that is not the incumbent is then refused at once
+    (`rate_limited`) instead of waiting for its turn. The reviewer measured it: the non-incumbent got
+    60 of 240 calls, with a 100 s gap between two of them. Only the credentials that get past the
+    per-credential negative cache cause this, so a mitigation would be a per-source or global
+    failed-spawn limit; that is a change of design and is not part of this one.
+  - *A newcomer waits out failed replacements ahead of it.* A failed replacement gives the incumbent
+    a fresh slice, so a valid newcomer queued behind a bad credential waits for that slice to end
+    before it may ask the incumbent to make way: one full slice (10 s by default) per bad credential
+    ahead of it, plus its own spawn. The reviewer measured 16.5 s with one bad credential ahead, and
+    `rate_limited` with three ahead at the 30 s wait.
+- A caller that disconnects (the MCP request's abort signal, tested over real HTTP) leaves every
+  queue at once and frees its place. This also holds while the child is still starting and just
+  before the call would run: a caller that has gone is rejected and its call (possibly a write) never
+  runs. The per-child queue (one running, 8 waiting) applies to callers waiting on a starting child too.
+- A **failed spawn** (wrong or revoked credentials, no route to the datacenter) is remembered for
+  **30 s**, keyed by the credential hash (at most 256 entries), and the same error is returned
+  without spawning. After 30 s the next call tries again.
+
+**Rolling this out.** Production runs the old default of 50 today: Conduit's bicep never sets
+`ACRONIS_POOL_MAX`. Moving to 1 child at 0.5 Gi (and 0.25 vCPU) means cold starts whenever more than
+one tenant is active, and `rate_limited` when the child is busy. Check the number of tenants active
+in a busy hour (distinct credentials calling this server) before the roll, and raise the container
+memory first if it is more than 1 (to 1 Gi for up to 4).
+
+Not bounded: native and external memory of a child beyond what the caps above keep small. The
+container's OOM restart is still the last backstop for that.
 
 Known upstream behaviours to be aware of:
 
@@ -123,6 +424,13 @@ threshold, descriptions are cut to the first sentence (max 300 chars) with the
 | `acronis_mark_alert_as_false_positive` | write | Alert Manager 1.0 |
 | `acronis_update_investigation_state` | write | Endpoint Detection and Response API 1.0 |
 | `acronis_execute_protection_policy` | write | Resource and Policy Management API v4 |
+
+**Before enabling writes (`ACRONIS_ENABLE_WRITES=true`)** two hardening items from the security
+review (WYREAI-711) are still open, and the fleet does not enable writes, so only the 34 reads are
+served: rejecting `.`, `..`, `/` and `%` in path parameters (which parameters are path parameters
+depends on each upstream endpoint, so a blanket string check would break legitimate filters), and a
+cap on the total response size (today each text block is capped at 100 KB, not their sum).
+
 ### Excluded categories
 
 Not exposed and not callable, whatever the environment:
@@ -159,9 +467,12 @@ Copy [`.env.example`](.env.example). Leave `CONDUIT_S2S_SECRET` empty in that fi
 | `X-Acronis-Client-Id` | API client ID |
 | `X-Acronis-Client-Secret` | API client secret |
 
-**Base URL validation (SSRF guard):** https only, hostname must end with `.acronis.com`, no
-userinfo, no non-default port, no path/query/fragment. Anything else is rejected (401 in gateway
-mode, no child spawned).
+**Base URL validation (SSRF guard):** https only, hostname must be **exactly one DNS label under
+`acronis.com`** (`eu8-cloud.acronis.com`; the same rule as Conduit), no userinfo, no non-default
+port, no path/query/fragment. So `acronis.com`, `a.b.acronis.com`, a trailing dot, `evilacronis.com`,
+`acronis.com.evil.com` and IDN/punycode look-alikes are all rejected (401 in gateway mode, no child
+spawned). The URL parser lowercases the host, so `EU8-Cloud.Acronis.com` is the same host and is
+stored lowercase.
 
 ### Environment variables
 
@@ -171,7 +482,9 @@ mode, no child spawned).
 | `ACRONIS_CLIENT_ID` | stdio and `AUTH_MODE=env` | API client ID |
 | `ACRONIS_CLIENT_SECRET` | stdio and `AUTH_MODE=env` | API client secret |
 | `ACRONIS_ENABLE_WRITES` | No | `true` exposes the 3 write tools. Default `false`. |
-| `ACRONIS_POOL_MAX` | No | Max concurrent upstream children (LRU). Default `50`. |
+| `ACRONIS_POOL_MAX` | No | Max concurrent upstream children. Default and ceiling are derived from the container memory (1 at 0.5 Gi, 4 at 1 Gi); this can only lower it. See "Pool sizing". |
+| `ACRONIS_MEMORY_LIMIT_MB` | No | Lowers the memory the pool sizes itself for, in MiB. Capped at the container limit Node reads (`process.constrainedMemory()`), and ignored, with a warning, when Node cannot read one (then the pool assumes 512 MiB). It can never raise the ceiling past the container. |
+| `ACRONIS_POOL_SLICE_MS` | No | How long (ms) a child serves its tenant, while another credential waits for a slot, before it takes no new calls and makes way, and the least time an idle child stays before another credential may replace it. Default `10000`; clamped to 1000-15000. See "Pool sizing". |
 | `ACRONIS_POOL_IDLE_MS` | No | Idle time before a child is closed. Default `600000` (10 min). |
 | `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
 | `AUTH_MODE` | No | `gateway` (Docker image and Compose default) or `env`. `env` uses `ACRONIS_*` only after S2S auth succeeds. |
@@ -224,7 +537,8 @@ MCP_TRANSPORT=http MCP_ALLOW_INSECURE_DEV=1 npm start
 
 The image (`node:26-alpine`, runs as user `acronis`) listens on `0.0.0.0` inside the container and
 defaults to `AUTH_MODE=gateway`. No registry auth or build secret is needed. The container needs
-outbound HTTPS to the Acronis datacenters.
+outbound HTTPS to the Acronis datacenters (see "Egress" for what restricts it). The build fails if
+the installed upstream bundle differs from the pin (`scripts/verify-upstream.mjs`).
 
 ```bash
 docker build --platform linux/amd64 -t acronis-mcp .
@@ -244,11 +558,15 @@ npm install
 npm run lint && npm run typecheck && npm test && npm run build
 npm run smoke        # dual-era HTTP smoke test (after build)
 npm run gen-tools    # regenerate src/generated/tools.ts
+npm run verify-upstream  # check the pinned upstream version, lockfile integrity and the sha256 of every file it runs
+npm run test:load     # sustained-load memory check of the built wrapper (after build; see "Pool sizing")
 ```
 
-The integration test spawns the real pinned package. Upstream 1.0.1 needs a token endpoint before it
-answers `tools/list`, so the test points `OAUTH_TOKEN_URL` (and a temp `HOME`) at a local fake while
-keeping `API_BASE_URL=https://example.acronis.com` and dummy credentials.
+The integration tests spawn the real pinned package. Upstream 1.0.1 needs a token endpoint before it
+answers `tools/list`, so the tests point the child's `API_BASE_URL` (and a temp `HOME`) at a local
+fake, with dummy credentials. `http-tenant-isolation.test.ts` goes through the real HTTP server and
+checks, against real child processes, that different credentials get separate children and never
+see each other's credentials.
 
 ## License
 

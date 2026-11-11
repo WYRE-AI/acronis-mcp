@@ -212,6 +212,27 @@ describe("tools/call enforcement", () => {
     expect(err.content[0].text).not.toContain(CREDS.clientSecret);
     expect(JSON.parse(err.content[0].text).error.code).toBe("upstream_unavailable");
   });
+
+  it("answers rate_limited (not upstream_unavailable) when the pool is full, and spawns nothing", async () => {
+    const spawned: string[] = [];
+    const spawner: Spawner = async (creds) => {
+      spawned.push(creds.clientId);
+      return { callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined };
+    };
+    const deps: ServerDeps = { writes: false, pool: new UpstreamPool({ toolsInclude: [], spawner, max: 1, waitMs: 5 }) };
+    let release!: () => void;
+    const held = deps.pool.withConnection(CREDS, () => new Promise<void>((r) => (release = r)));
+    await new Promise((r) => setTimeout(r, 0));
+
+    const other = { ...CREDS, clientId: "other-tenant" };
+    const res = await handleToolCall(deps, other, "acronis_fetch_all_alerts", {});
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0].text).error).toMatchObject({ code: "rate_limited" });
+    expect(spawned).toEqual([CREDS.clientId]);
+    release();
+    await held;
+    await deps.pool.close();
+  });
 });
 
 describe("makeMcpServerFactory credential binding", () => {

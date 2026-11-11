@@ -2,7 +2,8 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist/", "node_modules/", "coverage/"] },
+  // fixtures/ holds plain CommonJS preloads that run inside child processes.
+  { ignores: ["dist/", "node_modules/", "coverage/", "src/__tests__/fixtures/"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

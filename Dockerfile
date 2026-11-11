@@ -11,7 +11,8 @@ WORKDIR /app
 COPY package*.json ./
 
 # All dependencies (including the pinned @acronis-platform/mcp) come from the
-# public npm registry; no registry auth is needed.
+# public npm registry; no registry auth is needed. npm ci checks every tarball
+# against the integrity in package-lock.json.
 # --ignore-scripts prevents lifecycle scripts from running before source is copied.
 RUN npm ci --ignore-scripts
 
@@ -22,6 +23,12 @@ RUN npm run build
 # Prune dev dependencies in the builder so the production stage copies a
 # runtime-only node_modules (no re-install, no registry auth needed).
 RUN npm prune --omit=dev && npm cache clean --force
+
+# Supply chain (WYREAI-711): fail the build unless the upstream package that
+# ships (the node_modules copied below, so checked AFTER the prune) is byte for
+# byte the pinned one: version, lockfile integrity, and the sha256 of every file
+# it can run, including bin/cli.js, which is what the pool executes.
+RUN node scripts/verify-upstream.mjs
 
 # Production stage
 FROM node:26-alpine AS production
@@ -36,12 +43,21 @@ WORKDIR /app
 
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/dist ./dist
+# Preloaded into every upstream child (src/upstream-pool.ts).
+COPY --from=builder /app/child-egress-guard.cjs ./child-egress-guard.cjs
 COPY --from=builder /app/node_modules ./node_modules
 
 # Remove the npm CLI from the production image — the runtime only needs `node`,
 # and npm's bundled dependencies regularly trip vulnerability scanners.
-RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx && \
-    chown -R acronis:acronis /app
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
+# /app stays owned by root and is not writable by the app user (WYREAI-711).
+# The upstream children run as the same uid as the wrapper, so a hostile bundle
+# could otherwise rewrite the pinned bundle, the egress guard or the wrapper
+# itself for the next spawn. Nothing under /app is written at runtime: each
+# child gets a throwaway HOME under the temp directory. This does not stop a
+# child reading its siblings' /proc/<pid>/environ (README "Supply chain").
+RUN chmod -R a-w,a+rX /app && chown -R root:root /app
 
 USER acronis
 
@@ -63,7 +79,10 @@ ENV MCP_HTTP_HOST=0.0.0.0
 # fall back to ACRONIS_* environment variables.
 ENV AUTH_MODE=gateway
 
-CMD ["node", "dist/index.js"]
+# The wrapper's own memory is part of the 0.5 Gi budget (README "Pool sizing"):
+# cap its heap and young generation so one busy period cannot grow it past what
+# scripts/sustained-load.mjs measured. That script reads these flags from here.
+CMD ["node", "--max-old-space-size=64", "--max-semi-space-size=1", "dist/index.js"]
 
 ARG VERSION="unknown"
 ARG COMMIT_SHA="unknown"

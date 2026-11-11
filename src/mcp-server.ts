@@ -16,9 +16,10 @@ import {
   resolveGatewayCredentials,
   type AcronisCredentials,
 } from "./credentials.js";
+import { isOversizeResult, oversizeMessage } from "./oversize.js";
 import { errorResult, sanitizeToolResult } from "./sanitize.js";
 import { exposedTools, resolveUpstreamName, upstreamAllowlist, writesEnabled } from "./tiers.js";
-import { UpstreamPool, poolOptionsFromEnv } from "./upstream-pool.js";
+import { PoolBusyError, UpstreamPool, poolOptionsFromEnv } from "./upstream-pool.js";
 import { logger } from "./utils/logger.js";
 
 export const SERVER_NAME = "acronis-mcp";
@@ -70,7 +71,8 @@ export async function handleToolCall(
   deps: ServerDeps,
   credentials: AcronisCredentials | undefined,
   name: unknown,
-  args: unknown
+  args: unknown,
+  signal?: AbortSignal
 ) {
   // Second enforcement layer (the child also gets MCP_TOOLS_INCLUDE).
   const upstreamName = resolveUpstreamName(name, deps.writes);
@@ -88,13 +90,18 @@ export async function handleToolCall(
   const secrets = [credentials.clientSecret, credentials.clientId];
   try {
     const result = await deps.pool.withConnection(credentials, (conn) =>
-      conn.callTool(upstreamName, (args && typeof args === "object" ? args : {}) as Record<string, unknown>)
+      conn.callTool(upstreamName, (args && typeof args === "object" ? args : {}) as Record<string, unknown>),
+      signal
     );
+    // Too much data for a child to read: say how to ask for less, never an empty or partial list.
+    if (isOversizeResult(result)) return errorResult("response_too_large", oversizeMessage(String(name)));
     return sanitizeToolResult(result, secrets);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.warn("Upstream call failed", { tool: upstreamName });
-    return errorResult("upstream_unavailable", message, secrets);
+    // Pool full (the 429 case): say so, so the caller backs off instead of retrying hard.
+    const code = error instanceof PoolBusyError ? "rate_limited" : "upstream_unavailable";
+    return errorResult(code, message, secrets);
   }
 }
 
@@ -107,10 +114,10 @@ export function createMcpServer(deps: ServerDeps, credentials?: AcronisCredentia
 
   server.setRequestHandler("tools/list", async () => listToolsResult(deps.writes));
 
-  server.setRequestHandler("tools/call", async (request) => {
+  server.setRequestHandler("tools/call", async (request, ctx) => {
     const { name, arguments: args } = request.params;
     logger.debug("Tool call received", { tool: name });
-    return handleToolCall(deps, credentials, name, args);
+    return handleToolCall(deps, credentials, name, args, ctx.mcpReq.signal);
   });
 
   return server;
