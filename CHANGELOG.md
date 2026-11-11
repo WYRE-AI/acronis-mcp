@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The release for the entries below did not run when #9 was merged, because of a
+GitHub Actions outage, so it was re-triggered by a later commit to `main`.
+
 ### Security
 
 Partially clears the conditions of the security review (WYREAI-711). The items
