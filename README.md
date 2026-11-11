@@ -242,11 +242,15 @@ How the pool behaves at the ceiling:
   healthy tenants' children. From the moment that spawn starts the idle child takes no new calls: its
   tenant queues behind the newcomer. **The replacement lasts until the old child has exited**, not
   only until the new one is up, so there are never more than **max + 1** children alive (the +1 is
-  that replacement, and at most one runs at a time). A child that leaves the pool any other way
+  that replacement, and at most one runs at a time: the idle child it replaces is claimed until the
+  newcomer is up or has failed, and no second replacement may start before then). A child that leaves the pool any other way
   (evicted for idleness, or crashed) counts as alive until its close has finished too, so no child
   starts in its place before it has exited. The close escalates (stdin EOF, 2 s, SIGTERM,
-  2 s, SIGKILL; tested with a real child that ignores both) and the pool stops waiting for it after
-  8 s, so one stuck child cannot hold up every later replacement. A newcomer whose spawn **fails or
+  2 s, SIGKILL; tested with a real child that ignores both) and the pool stops counting a close that
+  never returns after 8 s, so one stuck child cannot hold up every later replacement. A child that
+  leaves the pool **while it is still starting** (its caller disconnected, then it was replaced) counts
+  until its spawn has ended, at most the 30 s spawn timeout, and then its close; shutdown never waits
+  more than 8 s for it. A newcomer whose spawn **fails or
   times out** has its child killed (SIGKILL) and the spawner waits for the process to really exit
   before it reports the failure, so the replacement slot is not released while that child is still
   dying (the SDK closes the transport itself on a connect timeout and a later close returns at
@@ -299,11 +303,12 @@ How the pool behaves at the ceiling:
   swaps spread the service thinly over all ten (4-8 calls each, 59 in all) and refused 492 calls.
   Neither is usable; more than about three active tenants needs more memory, so **1 Gi is a
   prerequisite for that**, not an optimisation.
-- **Bad credentials cannot starve a healthy tenant.** The negative cache (30 s) is per credential,
+- **Bad credentials cannot starve the incumbent tenant** (see the limitations below for what they
+  can still do to others). The negative cache (30 s) is per credential,
   so a stream of *different* bad credentials gets past it: each one that waits makes the incumbent
   yield once its slice is over, and the incumbent takes no new calls while the newcomer's spawn is
   tried. When that spawn fails the incumbent **keeps its child and gets a whole new slice** before
-  another credential may ask it to make way again. So the healthy tenant is held for one failed
+  another credential may ask it to make way again. So the incumbent, if healthy, is held for one failed
   spawn per slice it serves, and keeps at least `slice / (slice + 8 s)` of its time however many bad
   credentials rotate: **56% at the default 10 s slice if every bad spawn runs to the 8 s replacement
   timeout, 87% if each fails after 1.5 s** (and only 11% with the smallest slice, 1 s, which is one
@@ -311,6 +316,20 @@ How the pool behaves at the ceiling:
   32 distinct bad clientIds in 48 s, a healthy tenant calling twice a second): the reviewer measured
   1 call in 48 s with real children; the same shape on a fake clock, as a test, gave 20 of 96 before
   and gives 84 of 96 now, the longest gap between two of its calls 2 s.
+
+  **Known limitations of this queueing (not changed here).**
+  - *A non-incumbent can still be starved.* The guarantee above is for the tenant that already holds
+    the child. With two healthy tenants and a stream of distinct bad credentials, the bad ones keep
+    the 8-place queue full, and a healthy tenant that is not the incumbent is then refused at once
+    (`rate_limited`) instead of waiting for its turn. The reviewer measured it: the non-incumbent got
+    60 of 240 calls, with a 100 s gap between two of them. Only the credentials that get past the
+    per-credential negative cache cause this, so a mitigation would be a per-source or global
+    failed-spawn limit; that is a change of design and is not part of this one.
+  - *A newcomer waits out failed replacements ahead of it.* A failed replacement gives the incumbent
+    a fresh slice, so a valid newcomer queued behind a bad credential waits for that slice to end
+    before it may ask the incumbent to make way: one full slice (10 s by default) per bad credential
+    ahead of it, plus its own spawn. The reviewer measured 16.5 s with one bad credential ahead, and
+    `rate_limited` with three ahead at the 30 s wait.
 - A caller that disconnects (the MCP request's abort signal, tested over real HTTP) leaves every
   queue at once and frees its place. This also holds while the child is still starting and just
   before the call would run: a caller that has gone is rejected and its call (possibly a write) never

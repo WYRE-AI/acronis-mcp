@@ -136,6 +136,18 @@ under "Still open" are NOT done and must stay open until they are.
   then CODEOWNERS and the CI pin check are advisory.
 - Before enabling writes: rejecting `.`, `..`, `/` and `%` in path parameters.
 
+#### Known limitations (not changed by this change)
+
+- Bad credentials can still starve a healthy tenant that is not the incumbent.
+  The incumbent keeps its share, but a stream of distinct bad credentials keeps
+  the 8-place wait queue full and the other tenant is then refused at once
+  (reviewer's measurement: 60 of 240 calls, a 100 s gap). The queueing design is
+  unchanged here.
+- A failed replacement gives the incumbent a fresh slice, so a valid newcomer
+  waits one full slice (10 s by default) for each bad credential ahead of it, plus
+  its own spawn: 16.5 s with one ahead, `rate_limited` with three ahead at the
+  30 s wait.
+
 ### Changed
 
 - The default and maximum number of upstream children now come from the
@@ -150,14 +162,15 @@ under "Still open" are NOT done and must stay open until they are.
 - `scripts/sustained-load.mjs` now forwards `LOAD_STALL_MS` to the wrapper it
   starts, so `LOAD_STALL_MS=0` really turns the event-loop stall off (the
   wrapper's environment is built from scratch and always ran the default 100).
-- Distinct bad credentials can no longer starve a healthy tenant. The per-key
+- Distinct bad credentials can no longer starve the incumbent healthy tenant (not
+  a non-incumbent one: see "Known limitations"). The per-key
   negative cache does not stop a stream of different bad credentials, and each
   waiting one made the incumbent yield and block its own callers for the whole
   failing spawn, again as soon as the next one queued (reviewer's probe: max 1,
   slice 10 s, wait 30 s, 1.5 s bad spawns, 32 distinct clientIds: a tenant doing
   23 calls per 12 s dropped to 1 call in 48 s). Now, when a replacement spawn
   fails, the incumbent keeps its child and gets a whole new slice before it can be
-  asked to make way again. A healthy tenant is held for one failed spawn per slice
+  asked to make way again. The incumbent is held for one failed spawn per slice
   it serves, so it keeps at least slice / (slice + 8 s) of its time: 56% at the
   default 10 s slice if every bad spawn runs to its 8 s timeout, 87% for 1.5 s
   failures (only 11% at the 1 s minimum slice). The same probe shape as a test
@@ -183,6 +196,18 @@ under "Still open" are NOT done and must stay open until they are.
   bounded by the 8 s close limit for it too (it used to wait for the child to
   come up, up to the 30 s spawn timeout). Such a child is closed when it does
   come up, or killed by the spawn timeout.
+- A replaced child that was still starting (its caller had disconnected) was
+  forgotten by the pool after the 8 s close limit while its process was still
+  starting, which can take up to the 30 s spawn timeout, so a third child could
+  start beside it: 3 live processes at max 1 with the default settings. It now
+  counts until its spawn has ended and its close has finished; the 8 s limit
+  bounds only a close that never returns, and how long shutdown waits.
+- Two replacements could overlap: after the child being replaced by one newcomer
+  left the pool, a second newcomer could pick the same idle child, and if it
+  failed that child served a call and was then dropped while busy when the first
+  newcomer came up, leaving a live process the pool no longer counted (5 live at
+  max 3). A replacement now claims its idle child until the newcomer settles and
+  no other replacement starts meanwhile, so at most one runs at a time again.
 - The spawner removes a child's temporary `HOME` when `chmod` on it fails; it
   used to leave the directory behind.
 - Redaction of upstream tool output is now linear-time. The key/value and JWT
