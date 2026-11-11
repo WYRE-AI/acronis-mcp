@@ -18,7 +18,7 @@ import {
 } from "./credentials.js";
 import { errorResult, sanitizeToolResult } from "./sanitize.js";
 import { exposedTools, resolveUpstreamName, upstreamAllowlist, writesEnabled } from "./tiers.js";
-import { UpstreamPool, poolOptionsFromEnv } from "./upstream-pool.js";
+import { PoolBusyError, UpstreamPool, poolOptionsFromEnv } from "./upstream-pool.js";
 import { logger } from "./utils/logger.js";
 
 export const SERVER_NAME = "acronis-mcp";
@@ -94,7 +94,9 @@ export async function handleToolCall(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.warn("Upstream call failed", { tool: upstreamName });
-    return errorResult("upstream_unavailable", message, secrets);
+    // Pool full (the 429 case): say so, so the caller backs off instead of retrying hard.
+    const code = error instanceof PoolBusyError ? "rate_limited" : "upstream_unavailable";
+    return errorResult(code, message, secrets);
   }
 }
 

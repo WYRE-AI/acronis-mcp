@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_POOL_MAX,
+  MAX_FAILED_SPAWNS,
+  MAX_POOL_MAX,
   PoolBusyError,
   UpstreamPool,
   buildChildEnv,
@@ -193,17 +196,106 @@ describe("UpstreamPool", () => {
     await pool.close();
   });
 
-  it("does not cache a failed spawn", async () => {
-    let n = 0;
-    const spawner: Spawner = async () => {
-      if (n++ === 0) throw new Error("boom");
-      return { callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined };
-    };
-    const pool = new UpstreamPool({ toolsInclude: [], spawner });
-    await expect(use(pool, A)).rejects.toThrow("boom");
-    expect(pool.size).toBe(0);
-    await expect(use(pool, A)).resolves.toBeUndefined();
-    await pool.close();
+  describe("failed spawns (negative cache)", () => {
+    const okConn = (): UpstreamConnection => ({ callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined });
+
+    it("remembers a failed spawn per credential, so a bad credential does not respawn on every call", async () => {
+      let attempts = 0;
+      const spawner: Spawner = async () => {
+        attempts++;
+        throw new Error("invalid_client");
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner });
+      for (let i = 0; i < 20; i++) await expect(use(pool, A)).rejects.toThrow("invalid_client");
+      expect(attempts).toBe(1);
+      expect(pool.size).toBe(0);
+      await pool.close();
+    });
+
+    it("keys the failure by credential: another tenant is not affected", async () => {
+      const spawner: Spawner = async (creds) => {
+        if (creds.clientId === "a") throw new Error("invalid_client");
+        return okConn();
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner });
+      await expect(use(pool, A)).rejects.toThrow("invalid_client");
+      await expect(use(pool, B)).resolves.toBeUndefined();
+      await pool.close();
+    });
+
+    it("retries after the TTL, and a recovered credential works again", async () => {
+      let now = 1_000;
+      let attempts = 0;
+      const spawner: Spawner = async () => {
+        if (attempts++ === 0) throw new Error("boom");
+        return okConn();
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, failedSpawnTtlMs: 30_000, now: () => now });
+      await expect(use(pool, A)).rejects.toThrow("boom");
+      now += 29_000;
+      await expect(use(pool, A)).rejects.toThrow("boom"); // still cached
+      expect(attempts).toBe(1);
+      now += 2_000;
+      await expect(use(pool, A)).resolves.toBeUndefined(); // TTL over: respawns
+      expect(attempts).toBe(2);
+      await pool.close();
+    });
+
+    it("stores only a bounded number of failures and never the raw credential", async () => {
+      const spawner: Spawner = async () => {
+        throw new Error("nope");
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner });
+      for (let i = 0; i < MAX_FAILED_SPAWNS + 50; i++) {
+        await use(pool, { ...A, clientSecret: `secret-${i}` }).catch(() => undefined);
+      }
+      const cache = (pool as unknown as { failedSpawns: Map<string, unknown> }).failedSpawns;
+      expect(cache.size).toBe(MAX_FAILED_SPAWNS);
+      expect([...cache.keys()].every((k) => /^[0-9a-f]{64}$/.test(k))).toBe(true);
+      await pool.close();
+    });
+  });
+
+  describe("pool cap", () => {
+    it("defaults to 3 children, which fit the 0.5 Gi container (3 x ~116 MiB + wrapper)", () => {
+      expect(DEFAULT_POOL_MAX).toBe(3);
+      expect(poolOptionsFromEnv({}).max).toBe(3);
+    });
+
+    it("clamps max to MAX_POOL_MAX and never spawns beyond it", async () => {
+      const { spawner, spawned } = fakeSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1_000, waitMs: 5 });
+      const releases: Array<() => void> = [];
+      const held: Array<Promise<void>> = [];
+      for (let i = 0; i < MAX_POOL_MAX; i++) {
+        held.push(pool.withConnection({ ...A, clientId: `t${i}` }, () => new Promise<void>((r) => releases.push(r))));
+      }
+      await new Promise((r) => setTimeout(r, 10));
+      expect(spawned).toHaveLength(MAX_POOL_MAX);
+      await expect(use(pool, { ...A, clientId: "one-too-many" })).rejects.toBeInstanceOf(PoolBusyError);
+      expect(spawned).toHaveLength(MAX_POOL_MAX);
+      releases.forEach((r) => r());
+      await Promise.all(held);
+      await pool.close();
+    });
+
+    it("refuses at once when the wait queue is full, without waiting out waitMs", async () => {
+      const { spawner, spawned } = fakeSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, maxQueue: 2, waitMs: 60_000 });
+      let release!: () => void;
+      const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
+      await new Promise((r) => setTimeout(r, 0));
+      const queued = [1, 2].map((i) => use(pool, { ...B, clientId: `q${i}` }));
+      await new Promise((r) => setTimeout(r, 10));
+      const started = Date.now();
+      await expect(use(pool, { ...B, clientId: "q3" })).rejects.toBeInstanceOf(PoolBusyError);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(spawned).toHaveLength(1);
+      release();
+      await held;
+      await Promise.all(queued);
+      await pool.close();
+    });
   });
 
   it("close() closes every child and refuses further use", async () => {
@@ -219,10 +311,10 @@ describe("UpstreamPool", () => {
 });
 
 describe("poolOptionsFromEnv", () => {
-  it("defaults to 50 / 10 minutes and honours overrides", () => {
-    expect(poolOptionsFromEnv({})).toEqual({ max: 50, idleMs: 600_000 });
+  it("defaults to 3 / 10 minutes and honours overrides", () => {
+    expect(poolOptionsFromEnv({})).toEqual({ max: 3, idleMs: 600_000 });
     expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "5", ACRONIS_POOL_IDLE_MS: "1000" })).toEqual({ max: 5, idleMs: 1000 });
-    expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "abc", ACRONIS_POOL_IDLE_MS: "-3" })).toEqual({ max: 50, idleMs: 600_000 });
+    expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "abc", ACRONIS_POOL_IDLE_MS: "-3" })).toEqual({ max: 3, idleMs: 600_000 });
   });
 });
 

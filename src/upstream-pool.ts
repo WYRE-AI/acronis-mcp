@@ -8,6 +8,17 @@ import { tmpdir } from "node:os";
  *
  * The pool key is sha256(baseUrl + clientId + clientSecret); raw credential
  * values are never logged.
+ *
+ * Memory is the hard limit (WYREAI-711). Every child is a full Node process
+ * that loads the 5 MB upstream bundle: ~116 MiB RSS each, measured with the
+ * real child over 5 tenants (Node 26, macOS). The fleet runs this container
+ * with 0.5 Gi (azure/vendor-fleet.bicep `memory`), and the wrapper itself
+ * needs ~50-70 MiB, so 3 children (~350 MiB + wrapper) is what fits and the
+ * old default of 50 could not. Beyond the cap a new credential waits in a
+ * short, bounded queue and is then refused with PoolBusyError; it never
+ * spawns. Raise ACRONIS_POOL_MAX only together with the container memory
+ * (about 130 MiB per child plus 100 MiB for the wrapper), never above
+ * MAX_POOL_MAX.
  */
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -17,10 +28,22 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { AcronisCredentials } from "./credentials.js";
 import { logger } from "./utils/logger.js";
 
-export const DEFAULT_POOL_MAX = 50;
+/** Fits 0.5 Gi: 3 x ~116 MiB children + the wrapper. */
+export const DEFAULT_POOL_MAX = 3;
+/** Hard ceiling: ACRONIS_POOL_MAX above this is clamped (8 children need ~1.2 Gi). */
+export const MAX_POOL_MAX = 8;
 export const DEFAULT_POOL_IDLE_MS = 10 * 60 * 1000;
 /** How long a new credential waits for a free pool slot when every child is busy. */
 export const DEFAULT_POOL_WAIT_MS = 30_000;
+/** At most this many callers wait for a slot; the next one is refused at once. */
+export const DEFAULT_POOL_MAX_QUEUE = 8;
+/**
+ * A failed spawn (revoked or wrong credentials, no route) is remembered for
+ * this long, keyed by the credential hash, so a bad credential cannot cause a
+ * spawn per call. The cache holds at most MAX_FAILED_SPAWNS keys.
+ */
+export const FAILED_SPAWN_TTL_MS = 30_000;
+export const MAX_FAILED_SPAWNS = 256;
 export const UPSTREAM_PACKAGE = "@acronis-platform/mcp";
 
 export interface UpstreamCallResult {
@@ -161,6 +184,7 @@ interface Entry {
   retired: boolean;
 }
 
+/** The pool is full of busy children and the wait queue is full or timed out (a 429). */
 export class PoolBusyError extends Error {
   constructor() {
     super("Acronis is busy with other requests right now. Try again in a moment.");
@@ -171,10 +195,15 @@ export class PoolBusyError extends Error {
 export interface PoolOptions {
   toolsInclude: readonly string[];
   spawner?: Spawner;
+  /** Max children; clamped to MAX_POOL_MAX. */
   max?: number;
   idleMs?: number;
   /** Max wait for a free slot when the pool is full of busy children. */
   waitMs?: number;
+  /** Max callers waiting for a slot at once. */
+  maxQueue?: number;
+  /** How long a failed spawn is remembered. */
+  failedSpawnTtlMs?: number;
   now?: () => number;
 }
 
@@ -198,7 +227,11 @@ export class UpstreamPool {
   private readonly draining = new Set<Entry>();
   /** Callers waiting for a free slot (every indexed child busy). */
   private waiters: Array<() => void> = [];
+  /** Failed spawns by credential key (insertion order == age), kept for failedSpawnTtlMs. */
+  private readonly failedSpawns = new Map<string, { until: number; error: Error }>();
   private readonly waitMs: number;
+  private readonly maxQueue: number;
+  private readonly failedSpawnTtlMs: number;
   private readonly spawner: Spawner;
   private readonly toolsInclude: readonly string[];
   private readonly max: number;
@@ -210,9 +243,15 @@ export class UpstreamPool {
   constructor(opts: PoolOptions) {
     this.spawner = opts.spawner ?? defaultSpawner;
     this.toolsInclude = [...opts.toolsInclude];
-    this.max = opts.max ?? DEFAULT_POOL_MAX;
+    const requestedMax = opts.max ?? DEFAULT_POOL_MAX;
+    this.max = Math.min(requestedMax, MAX_POOL_MAX);
+    if (requestedMax > MAX_POOL_MAX) {
+      logger.warn("Pool max clamped to the memory-safe ceiling", { requested: requestedMax, max: this.max });
+    }
     this.idleMs = opts.idleMs ?? DEFAULT_POOL_IDLE_MS;
     this.waitMs = opts.waitMs ?? DEFAULT_POOL_WAIT_MS;
+    this.maxQueue = opts.maxQueue ?? DEFAULT_POOL_MAX_QUEUE;
+    this.failedSpawnTtlMs = opts.failedSpawnTtlMs ?? FAILED_SPAWN_TTL_MS;
     this.now = opts.now ?? Date.now;
   }
 
@@ -267,14 +306,35 @@ export class UpstreamPool {
         existing.inUse++;
         return existing;
       }
+      const failed = this.recentSpawnFailure(key);
+      if (failed) throw failed;
       if (this.hasCapacity()) {
         const entry = this.create(key, creds);
         entry.inUse++;
         return entry;
       }
       const remaining = deadline - this.now();
-      if (remaining <= 0) throw new PoolBusyError();
+      if (remaining <= 0 || this.waiters.length >= this.maxQueue) throw new PoolBusyError();
       await this.waitForSlot(remaining);
+    }
+  }
+
+  /** The error of a spawn that failed for this credential within the TTL, if any. */
+  private recentSpawnFailure(key: string): Error | undefined {
+    const failed = this.failedSpawns.get(key);
+    if (!failed) return undefined;
+    if (failed.until > this.now()) return failed.error;
+    this.failedSpawns.delete(key);
+    return undefined;
+  }
+
+  private rememberSpawnFailure(key: string, error: Error): void {
+    this.failedSpawns.delete(key); // re-insert so the oldest entry is always first
+    this.failedSpawns.set(key, { until: this.now() + this.failedSpawnTtlMs, error });
+    // Bounded: drop the oldest entries beyond the cap.
+    for (const oldest of this.failedSpawns.keys()) {
+      if (this.failedSpawns.size <= MAX_FAILED_SPAWNS) break;
+      this.failedSpawns.delete(oldest);
     }
   }
 
@@ -318,7 +378,11 @@ export class UpstreamPool {
     entry.conn = this.spawner(creds, this.toolsInclude, {
       onClose: () => this.drop(entry),
     });
-    entry.conn.catch(() => this.drop(entry)); // failed spawn must not poison the key
+    entry.conn.catch((error: unknown) => {
+      this.drop(entry);
+      // Remember the failure briefly so a bad credential cannot respawn on every call.
+      this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
+    });
     this.entries.set(key, entry);
     logger.debug("Upstream child spawned", { poolKey: key.slice(0, 12), size: this.entries.size });
     this.startSweeper();
