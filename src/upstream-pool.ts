@@ -767,14 +767,17 @@ export class UpstreamPool {
     this.sweeper.unref();
   }
 
-  /** Close the entry's child, once. Resolves when it has closed, or after closeTimeoutMs if it never does. */
+  /**
+   * Close the entry's child, once. Resolves when it has closed, or after closeTimeoutMs if it
+   * never does. That bound includes a child that is still starting: it is closed whenever it
+   * comes up (or killed by the spawner's own timeout), but nobody waits for it for up to 30 s.
+   */
   private closeEntry(entry: Entry): Promise<void> {
     entry.closing ??= (async () => {
       let timer: NodeJS.Timeout | undefined;
       try {
-        const conn = await entry.conn;
         await Promise.race([
-          conn.close(),
+          entry.conn.then((conn) => conn.close()),
           new Promise<void>((resolve) => {
             timer = setTimeout(() => {
               logger.warn("Upstream child did not close in time", { poolKey: entry.key.slice(0, 12) });

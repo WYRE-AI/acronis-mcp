@@ -623,6 +623,26 @@ describe("UpstreamPool", () => {
       expect(stats.spawned).toBe(3);
       await pool.close();
     });
+
+    it("close() does not wait for a child that is still starting: it returns within the close bound, and the child is closed when it comes up", async () => {
+      let up!: () => void;
+      const gate = new Promise<void>((r) => (up = r));
+      let closed = false;
+      const spawner: Spawner = async () => {
+        await gate; // a spawn that takes (up to) the 30 s spawn timeout
+        return { callTool: async () => ({}), listToolNames: async () => [], close: async () => void (closed = true) };
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, closeTimeoutMs: 50 });
+      const starting = use(pool, A).catch(() => undefined);
+      await tick();
+      const began = Date.now();
+      await pool.close();
+      expect(Date.now() - began).toBeLessThan(1_000);
+      expect(closed).toBe(false); // not up yet
+      up();
+      await vi.waitFor(() => expect(closed).toBe(true)); // and then it does not outlive the pool
+      await starting;
+    });
   });
 
   describe("fairness between tenants", () => {

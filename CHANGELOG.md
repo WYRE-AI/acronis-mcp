@@ -150,6 +150,10 @@ under "Still open" are NOT done and must stay open until they are.
 - `scripts/sustained-load.mjs` now forwards `LOAD_STALL_MS` to the wrapper it
   starts, so `LOAD_STALL_MS=0` really turns the event-loop stall off (the
   wrapper's environment is built from scratch and always ran the default 100).
+- Shutdown no longer waits for a child that is still starting: `close()` is
+  bounded by the 8 s close limit for it too (it used to wait for the child to
+  come up, up to the 30 s spawn timeout). Such a child is closed when it does
+  come up, or killed by the spawn timeout.
 - The spawner removes a child's temporary `HOME` when `chmod` on it fails; it
   used to leave the directory behind.
 - Redaction of upstream tool output is now linear-time. The key/value and JWT
