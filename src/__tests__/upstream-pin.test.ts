@@ -4,7 +4,7 @@
  * same script, so a changed bundle, lock entry or version fails the build.
  */
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -117,6 +117,38 @@ describe("upstream pin check", () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("sha256 of @acronis-platform/mcp/bin/cli.js: expected");
     expect(r.stderr).toContain("found missing");
+  });
+
+  it("fails on a symlink that is not pinned (it could point anywhere)", () => {
+    const root = fixtureRoot();
+    symlinkSync("/etc/hosts", join(root, "node_modules", pin.package, "dist/extra.js"));
+    const r = run(root);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("symlink in the package: dist/extra.js");
+  });
+
+  it("fails when a pinned file is replaced by a symlink to identical content (the hash alone would pass)", () => {
+    const root = fixtureRoot();
+    const elsewhere = join(root, "copy-of-cli.js");
+    cpSync(join(repo, "node_modules", pin.package, "bin/cli.js"), elsewhere);
+    rmSync(join(root, "node_modules", pin.package, "bin/cli.js"));
+    symlinkSync(elsewhere, join(root, "node_modules", pin.package, "bin/cli.js"));
+    const r = run(root);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("symlink in the package: bin/cli.js");
+    expect(r.stderr).toContain("found missing"); // and its content is not read through the link
+  });
+
+  it("fails when bin/ or dist/ is itself a symlink to a copy", () => {
+    const root = fixtureRoot();
+    const pkgDir = join(root, "node_modules", pin.package);
+    const copy = join(root, "dist-copy");
+    cpSync(join(pkgDir, "dist"), copy, { recursive: true });
+    rmSync(join(pkgDir, "dist"), { recursive: true });
+    symlinkSync(copy, join(pkgDir, "dist"));
+    const r = run(root);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("symlink in the package: dist");
   });
 
   it("pins the file the pool executes, not just the bundle behind it", () => {
