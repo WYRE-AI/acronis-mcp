@@ -18,13 +18,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AcronisCredentials } from "../credentials.js";
+import { isOversizeResult } from "../oversize.js";
 import { upstreamAllowlist } from "../tiers.js";
-import { CHILD_MAX_OLD_SPACE_MB, UpstreamPool, createStdioSpawner, credentialKey } from "../upstream-pool.js";
+import { CHILD_MAX_OLD_SPACE_MB, MAX_SEMI_SPACE_MB, UpstreamPool, createStdioSpawner, credentialKey } from "../upstream-pool.js";
 
 const RECORDER = new URL("./fixtures/record-child.cjs", import.meta.url).pathname;
 const base = { baseUrl: "https://eu8-cloud.acronis.com", clientSecret: "dummy-secret" };
 const BIG: AcronisCredentials = { ...base, clientId: "tenant-big" };
 const OK: AcronisCredentials = { ...base, clientId: "tenant-ok" };
+const SIZED: AcronisCredentials = { ...base, clientId: "tenant-sized" };
+/** A response just under the cap, as a list of small objects the way Acronis returns them. */
+const NEAR_CAP_BODY = JSON.stringify({
+  items: Array.from({ length: 1_600 }, (_, i) => ({ id: `${i}`.padStart(36, "0"), message: "x".repeat(100) })),
+});
 
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
 const alive = (pid: number) => {
@@ -63,6 +69,10 @@ beforeAll(async () => {
       }
       const bearer = String(req.headers.authorization ?? "").replace(/^Bearer /i, "");
       const claims = bearer ? JSON.parse(Buffer.from(bearer.split(".")[1] ?? "", "base64url").toString("utf8") || "{}") : {};
+      if (claims.cid === SIZED.clientId && !req.url?.includes("resolve_ids")) {
+        res.end(NEAR_CAP_BODY);
+        return;
+      }
       if (req.url?.includes("resolve_ids") || claims.cid !== BIG.clientId) {
         res.end(JSON.stringify({ items: [{ ok: true }] }));
         return;
@@ -125,14 +135,16 @@ describe("child memory limits (real upstream child)", () => {
     await pool.withConnection(OK, (c) => c.listToolNames());
     const [child] = records();
     expect(child.execArgv).toContain(`--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`);
+    expect(child.execArgv).toContain(`--max-semi-space-size=${MAX_SEMI_SPACE_MB}`);
     expect(child.execArgv.some((a) => a.endsWith("child-egress-guard.cjs"))).toBe(true);
   }, 60_000);
 
   it("aborts a hostile endless response, leaves the child and other tenants working", async () => {
     const pool = newPool();
     await pool.withConnection(OK, (c) => c.listToolNames());
-    const hostile = JSON.stringify(await call(pool, BIG));
-    expect(hostile).toContain("larger than 524288 bytes");
+    const result = await call(pool, BIG);
+    expect(JSON.stringify(result)).toContain("larger than 262144 bytes");
+    expect(isOversizeResult(result)).toBe(true); // the wrapper recognises what the real child says
     // The child stopped reading almost at once: the fake could send only a little of its 200 MiB.
     expect(hostileBytesSent).toBeLessThan(8 * 1024 * 1024);
     // Both children are still up and answer, and the other tenant never saw the hostile data.
@@ -140,6 +152,19 @@ describe("child memory limits (real upstream child)", () => {
     expect(JSON.stringify(await call(pool, OK))).toContain("ok");
     expect(alive(pidOf(BIG))).toBe(true);
     expect(alive(pidOf(OK))).toBe(true);
+  }, 60_000);
+
+  it("runs several calls that each return nearly the cap one at a time in the same child, and the child survives", async () => {
+    expect(NEAR_CAP_BODY.length).toBeGreaterThan(200 * 1024);
+    expect(NEAR_CAP_BODY.length).toBeLessThan(256 * 1024);
+    const pool = newPool();
+    const results = await Promise.all(Array.from({ length: 4 }, () => call(pool, SIZED)));
+    for (const r of results) {
+      expect(r.isError).toBeFalsy();
+      expect(JSON.stringify(r)).toContain("0000000000000000000000000000000000"); // the list itself came back
+    }
+    expect(records().filter((r) => r.env.OAUTH_CLIENT_ID === SIZED.clientId)).toHaveLength(1); // one child, never restarted
+    expect(alive(pidOf(SIZED))).toBe(true);
   }, 60_000);
 
   it("kills only the child that exhausts its heap; the wrapper and other tenants keep working", async () => {

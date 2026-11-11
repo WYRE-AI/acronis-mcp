@@ -13,7 +13,7 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const GUARD = new URL("../../child-egress-guard.cjs", import.meta.url).pathname;
-const CAP = 512 * 1024;
+const CAP = 256 * 1024;
 
 interface Hits {
   urls: string[];
@@ -101,6 +101,31 @@ describe("child egress guard", () => {
     expect(elsewhere.hits.urls).toEqual([]);
   });
 
+  it("reads a URL's href once: an instance whose href changes between reads cannot pass the check and request another host", async () => {
+    const out = await inChild(`
+      let reads = 0;
+      const url = new URL(process.env.API_BASE_URL + "/small");
+      Object.defineProperty(url, "href", { get: () => (++reads === 1 ? process.env.API_BASE_URL + "/small" : process.env.EVIL + "/evil") });
+      fetch(url)${show}`);
+    expect(out).toBe("OK 201 5");
+    expect(elsewhere.hits.urls).toEqual([]);
+  });
+
+  it("reads a URL subclass's href once as well, whether or not it is the first read that is honest", async () => {
+    const out = await inChild(`
+      (async () => {
+        let reads = 0;
+        class Sneaky extends URL {
+          get href() { return ++reads % 2 === 1 ? process.env.API_BASE_URL + "/small" : process.env.EVIL + "/evil"; }
+        }
+        for (let i = 0; i < 2; i++) {
+          await fetch(new Sneaky(process.env.API_BASE_URL + "/small")).then(async (r) => console.log("OK " + r.status), (e) => console.log("ERR " + e.message.slice(0, 7)));
+        }
+      })();`);
+    expect(out.split("\n")).toEqual(["OK 201", "OK 201"]);
+    expect(elsewhere.hits.urls).toEqual([]);
+  });
+
   it("allows a string, a URL and a Request for its own origin", async () => {
     const out = await inChild(`
       (async () => {
@@ -142,11 +167,11 @@ describe("child egress guard", () => {
 
   it("rejects a response whose declared Content-Length is over the cap, without reading it", async () => {
     const out = await inChild(`fetch(process.env.API_BASE_URL + "/declared-big")${show}`);
-    expect(out).toMatch(/^ERR Acronis response is larger than 524288 bytes/);
+    expect(out).toMatch(/^ERR Acronis response is larger than 262144 bytes/);
   });
 
   it("aborts a chunked response (no Content-Length) while reading it once it passes the cap", async () => {
     const out = await inChild(`fetch(process.env.API_BASE_URL + "/chunked-big")${show}`);
-    expect(out).toMatch(/^ERR Acronis response is larger than 524288 bytes/);
+    expect(out).toMatch(/^ERR Acronis response is larger than 262144 bytes/);
   });
 });

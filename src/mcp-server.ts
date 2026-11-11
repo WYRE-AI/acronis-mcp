@@ -16,6 +16,7 @@ import {
   resolveGatewayCredentials,
   type AcronisCredentials,
 } from "./credentials.js";
+import { isOversizeResult, oversizeMessage } from "./oversize.js";
 import { errorResult, sanitizeToolResult } from "./sanitize.js";
 import { exposedTools, resolveUpstreamName, upstreamAllowlist, writesEnabled } from "./tiers.js";
 import { PoolBusyError, UpstreamPool, poolOptionsFromEnv } from "./upstream-pool.js";
@@ -92,6 +93,8 @@ export async function handleToolCall(
       conn.callTool(upstreamName, (args && typeof args === "object" ? args : {}) as Record<string, unknown>),
       signal
     );
+    // Too much data for a child to read: say how to ask for less, never an empty or partial list.
+    if (isOversizeResult(result)) return errorResult("response_too_large", oversizeMessage(String(name)));
     return sanitizeToolResult(result, secrets);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

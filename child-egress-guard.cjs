@@ -17,25 +17,29 @@
 "use strict";
 
 /** Largest upstream response body a child will read (decoded bytes). */
-const MAX_RESPONSE_BYTES = 512 * 1024;
+const MAX_RESPONSE_BYTES = 256 * 1024;
 
 const apiOrigin = new URL(process.env.API_BASE_URL).origin;
 const realFetch = globalThis.fetch;
-// Read through the prototype so a Request subclass cannot report another URL.
+// Read through the prototypes so a subclass or an instance property cannot report another URL.
 const requestUrl = Object.getOwnPropertyDescriptor(Request.prototype, "url").get;
+const urlHref = Object.getOwnPropertyDescriptor(URL.prototype, "href").get;
 
 /**
- * The URL being requested, read exactly once. A string or URL is used as is;
- * a Request is passed through (its url comes from the prototype getter); any
- * other object is reduced to the string we checked, so the real fetch cannot
- * coerce it (toString) into a different URL than the one that was approved.
+ * The URL being requested, read exactly once, as a string. That string is both
+ * what is checked and what is forwarded, so no getter or toString() can answer
+ * differently the second time. A Request is passed through as is: its url comes
+ * from the prototype getter and the real fetch uses the same internal value.
  */
 function normalise(input) {
   if (typeof input === "string") return { target: new URL(input), forward: input };
-  if (input instanceof URL) return { target: new URL(input.href), forward: input.href };
+  if (input instanceof URL) {
+    const href = urlHref.call(input);
+    return { target: new URL(href), forward: href };
+  }
   if (input instanceof Request) return { target: new URL(requestUrl.call(input)), forward: input };
-  const target = new URL(input.url);
-  return { target, forward: target.href };
+  const url = String(input.url);
+  return { target: new URL(url), forward: url };
 }
 
 function tooLarge() {
