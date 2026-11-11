@@ -597,6 +597,22 @@ describe("UpstreamPool", () => {
       expect(stats.live).toBe(0);
     }, 30_000);
 
+    it.each([2, 4])(
+      "a child evicted for idleness counts toward capacity until it has exited: at max %i, newcomers arriving while every idle child closes (100 ms) never push live children past max + 1",
+      async (max) => {
+        const { spawner, stats } = slowSpawner(5, 100);
+        let now = 1_000;
+        const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max, memoryLimitBytes: 2 ** 30, idleMs: 50, now: () => now, waitMs: 60_000, maxQueue: 64 });
+        const tenant = (prefix: string, i: number) => ({ ...A, clientId: `${prefix}${i}` });
+        for (let i = 0; i < max; i++) await use(pool, tenant("old", i)); // a full pool of children
+        now += 1_000; // all idle for longer than idleMs
+        await Promise.all(Array.from({ length: 2 * max }, (_, i) => use(pool, tenant("new", i)))); // the first call evicts them all
+        expect(stats.peakLive).toBeLessThanOrEqual(max + 1); // before: 2 * max, the evicted ones still exiting beside the newcomers
+        await pool.close();
+        expect(stats.live).toBe(0);
+      }
+    );
+
     it("does not start the next replacement until the evicted child has exited", async () => {
       const { spawner, stats } = slowSpawner(5, 200);
       const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, waitMs: 60_000 });

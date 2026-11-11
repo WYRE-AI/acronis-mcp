@@ -20,10 +20,11 @@ import { tmpdir } from "node:os";
  *
  * poolCeilingForMemory turns those peaks into a child count with a 15% margin:
  * 1 child at 0.5 Gi (the fleet today, azure/vendor-fleet.bicep `memory`), 2 at
- * 0.75 Gi, 4 at 1 Gi. The pool is never above max children plus the one replacement that
- * starts before an idle child is evicted, and that replacement is counted until the
- * evicted child has actually exited. Beyond that a new credential waits in a short,
- * bounded queue and is then refused with PoolBusyError; it never spawns.
+ * 0.75 Gi, 4 at 1 Gi. Live processes are never above max plus the one replacement that
+ * starts before an idle child is evicted. A child that has left the pool (replaced, evicted
+ * for idleness or crashed) still counts until its close has finished, so nothing starts in
+ * its place before it has exited. Beyond that a new credential waits in a short, bounded
+ * queue and is then refused with PoolBusyError; it never spawns.
  *
  * Fairness: a child serves its tenant freely while nobody else waits. Once another
  * credential is waiting for a slot and the child has held its slot for a time slice
@@ -431,12 +432,13 @@ export class UpstreamPool {
    */
   private readonly waitingFor = new Map<string, number>();
   /**
-   * The child a new one is replacing, from the moment the new child starts until
-   * the old one has exited. The pool is one over max for that time, so at most one.
+   * Children that have left `entries` but whose close has not finished (evicted for
+   * idleness, replaced, or gone after a crash). They are still processes, so they count
+   * toward capacity until the close resolves; see `live`.
    */
+  private readonly closingEntries = new Set<Entry>();
+  /** The idle child a starting newcomer is replacing, until that newcomer is up or has failed. */
   private replacementVictim: Entry | undefined;
-  /** The victim's close, which ends the replacement. Only meaningful while replacementVictim is set. */
-  private victimClosing: Promise<void> = Promise.resolve();
   /** Failed spawns by credential key (insertion order == age), kept for failedSpawnTtlMs. */
   private readonly failedSpawns = new Map<string, { until: number; error: Error }>();
   private readonly waitMs: number;
@@ -480,6 +482,11 @@ export class UpstreamPool {
 
   get size(): number {
     return this.entries.size;
+  }
+
+  /** Children that exist as processes: the pool's entries plus those still closing. */
+  private get live(): number {
+    return this.entries.size + this.closingEntries.size;
   }
 
   keys(): string[] {
@@ -568,8 +575,12 @@ export class UpstreamPool {
         } else {
           const failed = this.recentSpawnFailure(key);
           if (failed) throw failed;
-          const room = this.entries.size < this.max;
-          const victim = room || this.replacementVictim ? undefined : this.leastRecentlyUsedIdle();
+          // Children still closing count as live, so there is only room once they have exited.
+          // A full pool of the pool's own children, with nothing closing and no replacement
+          // under way (that would make it max + 1 entries), may replace an idle one.
+          const room = this.live < this.max;
+          const full = this.entries.size === this.max && this.closingEntries.size === 0;
+          const victim = full ? this.leastRecentlyUsedIdle() : undefined;
           if (room || victim) {
             const entry = this.create(key, creds, victim);
             entry.inUse++;
@@ -685,8 +696,8 @@ export class UpstreamPool {
    * out. From the moment the spawn starts the victim takes no new calls (see
    * mustYield): its callers wait for a slot like a new credential, behind the
    * newcomer, so the victim is still idle when the newcomer is up. So the pool is
-   * never above max children plus this one replacement, and `replacementVictim`
-   * keeps it to one, until the victim has exited.
+   * never above max children plus this one replacement: the victim keeps counting
+   * as live until it has exited (see `live`), and nothing else starts before that.
    */
   private create(key: string, creds: AcronisCredentials, victim?: Entry): Entry {
     const entry: Entry = {
@@ -704,23 +715,18 @@ export class UpstreamPool {
       ...(victim ? { spawnTimeoutMs: REPLACEMENT_SPAWN_TIMEOUT_MS } : {}),
     });
     entry.conn = victim ? spawned.then((conn) => this.closeVictim(victim, conn)) : spawned;
-    entry.conn.catch((error: unknown) => {
-      this.drop(entry);
-      // Remember a failed spawn briefly so a bad credential cannot respawn on every call.
-      this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
-    });
-    if (victim) {
-      // The replacement ends when the newcomer is up (or failed) AND the old child has exited.
-      this.replacementVictim = victim;
-      entry.conn
-        .catch(() => undefined)
-        .then(() => this.victimClosing)
-        .then(() => {
-          this.replacementVictim = undefined;
-          this.victimClosing = Promise.resolve();
-          this.wake();
-        });
-    }
+    if (victim) this.replacementVictim = victim;
+    entry.conn
+      .catch((error: unknown) => {
+        this.drop(entry);
+        // Remember a failed spawn briefly so a bad credential cannot respawn on every call.
+        this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
+      })
+      .finally(() => {
+        if (!victim) return;
+        this.replacementVictim = undefined; // the newcomer is up (the victim is closing) or failed (the victim stays)
+        this.wake();
+      });
     this.entries.set(key, entry);
     logger.debug("Upstream child spawned", { poolKey: key.slice(0, 12), size: this.entries.size });
     this.startSweeper();
@@ -732,7 +738,6 @@ export class UpstreamPool {
     if (this.entries.size > this.max) {
       logger.debug("Upstream child evicted (LRU)", { poolKey: victim.key.slice(0, 12) });
       this.drop(victim);
-      this.victimClosing = this.closeEntry(victim); // the same close drop started
     }
     return conn;
   }
@@ -774,6 +779,7 @@ export class UpstreamPool {
    */
   private closeEntry(entry: Entry): Promise<void> {
     entry.closing ??= (async () => {
+      this.closingEntries.add(entry);
       let timer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
@@ -790,6 +796,8 @@ export class UpstreamPool {
         /* spawn failed or already closed */
       } finally {
         clearTimeout(timer);
+        this.closingEntries.delete(entry);
+        this.wake(); // there may be room now
       }
     })();
     return entry.closing;

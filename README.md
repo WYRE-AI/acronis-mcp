@@ -242,7 +242,9 @@ How the pool behaves at the ceiling:
   healthy tenants' children. From the moment that spawn starts the idle child takes no new calls: its
   tenant queues behind the newcomer. **The replacement lasts until the old child has exited**, not
   only until the new one is up, so there are never more than **max + 1** children alive (the +1 is
-  that replacement, and at most one runs at a time). The close escalates (stdin EOF, 2 s, SIGTERM,
+  that replacement, and at most one runs at a time). A child that leaves the pool any other way
+  (evicted for idleness, or crashed) counts as alive until its close has finished too, so no child
+  starts in its place before it has exited. The close escalates (stdin EOF, 2 s, SIGTERM,
   2 s, SIGKILL; tested with a real child that ignores both) and the pool stops waiting for it after
   8 s, so one stuck child cannot hold up every later replacement. A newcomer whose spawn **fails or
   times out** has its child killed (SIGKILL) and the spawner waits for the process to really exit

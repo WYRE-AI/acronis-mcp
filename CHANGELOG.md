@@ -150,6 +150,14 @@ under "Still open" are NOT done and must stay open until they are.
 - `scripts/sustained-load.mjs` now forwards `LOAD_STALL_MS` to the wrapper it
   starts, so `LOAD_STALL_MS=0` really turns the event-loop stall off (the
   wrapper's environment is built from scratch and always ran the default 100).
+- A child evicted for idleness is counted against the pool's capacity until its
+  process has exited, like a replaced child. Before, it left the pool at once
+  while its close was still running, so newcomers started beside it: with max 2,
+  an idle timeout of 50 ms and a 300 ms close, two newcomers arriving as two idle
+  children were evicted peaked at 4 live children (the reviewer's probe). The
+  test at max 2 and max 4 now asserts at most max + 1 live children; at max 4 it
+  measured 9 before. The documented bound of max + 1 now holds for every path
+  (idle eviction, replacement, crash).
 - Shutdown no longer waits for a child that is still starting: `close()` is
   bounded by the 8 s close limit for it too (it used to wait for the child to
   come up, up to the 30 s spawn timeout). Such a child is closed when it does
