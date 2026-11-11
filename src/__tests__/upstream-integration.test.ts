@@ -4,9 +4,10 @@
  *
  * NOTE: upstream 1.0.1 fetches a client_credentials token eagerly at startup
  * (before it will answer tools/list), so "dummy creds, no API contact" is not
- * possible. The child still gets API_BASE_URL=https://example.acronis.com and
- * dummy credentials; only OAUTH_TOKEN_URL (and a temp HOME for the upstream's
- * token cache) are redirected to a local fake token endpoint.
+ * possible. The child gets dummy credentials, and its API_BASE_URL (and a temp
+ * HOME for the upstream's token cache) are pointed at a local fake. The egress
+ * guard lets a child reach only the origin of its own API_BASE_URL, so the fake
+ * is that origin; the token URL is the upstream default, `<API_BASE_URL>/api/2/idp/token`.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -50,10 +51,7 @@ beforeAll(async () => {
   });
   await new Promise<void>((r) => fake.listen(0, "127.0.0.1", r));
   const { port } = fake.address() as AddressInfo;
-  spawner = createStdioSpawner({
-    OAUTH_TOKEN_URL: `http://127.0.0.1:${port}/api/2/idp/token`,
-    HOME: home,
-  });
+  spawner = createStdioSpawner({ API_BASE_URL: `http://127.0.0.1:${port}`, HOME: home });
 });
 
 afterAll(async () => {
@@ -96,7 +94,7 @@ describe("real upstream child", () => {
     const { port } = bad.address() as AddressInfo;
     const pool = new UpstreamPool({
       toolsInclude: upstreamAllowlist(false),
-      spawner: createStdioSpawner({ OAUTH_TOKEN_URL: `http://127.0.0.1:${port}/api/2/idp/token`, HOME: home }),
+      spawner: createStdioSpawner({ API_BASE_URL: `http://127.0.0.1:${port}`, HOME: home }),
     });
     try {
       await expect(pool.withConnection(CREDS, (c) => c.listToolNames())).rejects.toThrow();
@@ -104,6 +102,72 @@ describe("real upstream child", () => {
     } finally {
       await pool.close();
       await new Promise<void>((r) => bad.close(() => r()));
+    }
+  }, 60_000);
+});
+
+/**
+ * Egress guard (child-egress-guard.cjs): the child reaches only the origin of its
+ * own API_BASE_URL and never follows a redirect, so the client_secret in the
+ * token request cannot be replayed to another host (WYREAI-711).
+ */
+describe("child egress guard", () => {
+  /** A local server that records every request it receives. */
+  async function recorder(handler?: (res: import("node:http").ServerResponse) => void) {
+    const hits: string[] = [];
+    const server = createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`);
+      if (handler) handler(res);
+      else res.end("{}");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    return { hits, origin, close: () => new Promise<void>((r) => server.close(() => r())) };
+  }
+
+  const spawnWith = async (env: Record<string, string>) => {
+    const pool = new UpstreamPool({
+      toolsInclude: upstreamAllowlist(false),
+      spawner: createStdioSpawner({ ...env, HOME: home }),
+    });
+    try {
+      return await pool.withConnection(CREDS, (c) => c.listToolNames()).then(
+        () => "started",
+        () => "failed"
+      );
+    } finally {
+      await pool.close();
+    }
+  };
+
+  it("does not follow a redirect from the token endpoint, so the secret is not replayed", async () => {
+    const elsewhere = await recorder();
+    const api = await recorder((res) => {
+      res.statusCode = 307;
+      res.setHeader("location", `${elsewhere.origin}/steal`);
+      res.end();
+    });
+    try {
+      expect(await spawnWith({ API_BASE_URL: api.origin })).toBe("failed");
+      expect(api.hits).toHaveLength(1); // the token POST reached its own origin...
+      expect(elsewhere.hits).toEqual([]); // ...and was not replayed anywhere else
+    } finally {
+      await Promise.all([api.close(), elsewhere.close()]);
+    }
+  }, 60_000);
+
+  it("refuses a token URL on any origin other than API_BASE_URL", async () => {
+    const api = await recorder();
+    const other = await recorder();
+    try {
+      const outcome = await spawnWith({
+        API_BASE_URL: api.origin,
+        OAUTH_TOKEN_URL: `${other.origin}/api/2/idp/token`,
+      });
+      expect(outcome).toBe("failed");
+      expect(other.hits).toEqual([]);
+    } finally {
+      await Promise.all([api.close(), other.close()]);
     }
   }, 60_000);
 });

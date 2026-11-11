@@ -11,11 +11,16 @@ WORKDIR /app
 COPY package*.json ./
 
 # All dependencies (including the pinned @acronis-platform/mcp) come from the
-# public npm registry; no registry auth is needed.
+# public npm registry; no registry auth is needed. npm ci checks every tarball
+# against the integrity in package-lock.json.
 # --ignore-scripts prevents lifecycle scripts from running before source is copied.
 RUN npm ci --ignore-scripts
 
 COPY . .
+
+# Supply chain (WYREAI-711): fail the build unless the installed upstream bundle
+# is byte for byte the pinned one (version, lockfile integrity, bundle sha256).
+RUN node scripts/verify-upstream.mjs
 
 RUN npm run build
 
@@ -36,6 +41,8 @@ WORKDIR /app
 
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/dist ./dist
+# Preloaded into every upstream child (src/upstream-pool.ts).
+COPY --from=builder /app/child-egress-guard.cjs ./child-egress-guard.cjs
 COPY --from=builder /app/node_modules ./node_modules
 
 # Remove the npm CLI from the production image — the runtime only needs `node`,

@@ -1,0 +1,19 @@
+# Everything that decides which upstream bundle runs, what it may reach, and
+# how CI and releases treat it needs a human review from one of these owners
+# (WYREAI-711). A bump of @acronis-platform/mcp must carry a human diff of the
+# new bundle (README "Upstream pinning"); no bot may merge it.
+#
+# GitHub only enforces this when the branch protection rule on main has
+# "Require review from Code Owners" enabled (a repository setting, not a file).
+
+/package.json                 @asachs01 @arutherford
+/package-lock.json            @asachs01 @arutherford
+/scripts/upstream-pin.json    @asachs01 @arutherford
+/scripts/verify-upstream.mjs  @asachs01 @arutherford
+/child-egress-guard.cjs       @asachs01 @arutherford
+/Dockerfile                   @asachs01 @arutherford
+/research/                    @asachs01 @arutherford
+/src/generated/               @asachs01 @arutherford
+/src/upstream-pool.ts         @asachs01 @arutherford
+/src/credentials.ts           @asachs01 @arutherford
+/.github/                     @asachs01 @arutherford

@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import type { AcronisCredentials } from "./credentials.js";
@@ -45,6 +46,14 @@ export const DEFAULT_POOL_MAX_QUEUE = 8;
 export const FAILED_SPAWN_TTL_MS = 30_000;
 export const MAX_FAILED_SPAWNS = 256;
 export const UPSTREAM_PACKAGE = "@acronis-platform/mcp";
+
+/**
+ * Preloaded into every child (`node --require`). Lets the child reach only the
+ * origin of its own API_BASE_URL and refuses redirects, so the client_secret in
+ * the token request cannot be replayed to another host. Plain CJS at the repo
+ * root so it resolves the same from src/ (tests) and dist/.
+ */
+const EGRESS_GUARD = fileURLToPath(new URL("../child-egress-guard.cjs", import.meta.url));
 
 export interface UpstreamCallResult {
   content?: unknown;
@@ -118,7 +127,7 @@ export function createStdioSpawner(extraEnv: Record<string, string> = {}): Spawn
     const removeHome = () => rm(childHome, { recursive: true, force: true }).catch(() => undefined);
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: [resolveUpstreamBin()],
+      args: ["--require", EGRESS_GUARD, resolveUpstreamBin()],
       env: { ...buildChildEnv(creds, toolsInclude), HOME: childHome, ...extraEnv },
       stderr: "pipe",
     });
