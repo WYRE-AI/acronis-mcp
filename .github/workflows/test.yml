@@ -52,6 +52,11 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # WYREAI-711: the pool is sized from measured peaks. Runs alone, after the
+      # other tests, so it has the CPU to itself, and prints the numbers.
+      - name: Sustained-load memory check
+        run: npm run test:load
+
       - name: Test Docker build
         run: docker build -t acronis-mcp:test .
 

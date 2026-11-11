@@ -8,7 +8,8 @@
  * response cap, several callers on several tenants for a few seconds, and the
  * wrapper's event loop stalled as a 0.25 vCPU container stalls it.
  *
- * Needs `npm run build` first (CI does). RSS differs between macOS and Linux, so
+ * Run it with `npm run test:load`; it is not part of `npm test` because it needs
+ * the CPU to itself. Needs `npm run build` first (CI does). RSS differs between macOS and Linux, so
  * a failure on a new platform means "re-measure and re-size", not just "retry".
  * Set ACRONIS_SKIP_LOAD_TEST=1 to skip it (slow machines, shared CI runners).
  */
@@ -36,6 +37,7 @@ function load(env: Record<string, string>): LoadResult {
   });
   const line = r.stdout.trim().split("\n").at(-1) ?? "";
   try {
+    console.log(line); // the numbers, for the CI log
     return JSON.parse(line) as LoadResult;
   } catch {
     throw new Error(`sustained-load.mjs printed no result (exit ${r.status}): ${r.stdout}\n${r.stderr}`);

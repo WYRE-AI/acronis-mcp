@@ -151,9 +151,10 @@ process with the flags from the Dockerfile `CMD`, a real HTTP server, the real p
 children and the real egress guard, against a fake Acronis that answers with realistic JSON lists at
 the response cap. Several callers on several tenants run for 6 s while the wrapper's event loop is
 stalled for 100 ms every 250 ms (a 0.25 vCPU container does this under load), and the RSS of the
-wrapper and of each child is sampled every 20 ms. `src/__tests__/sustained-load.test.ts` runs it as a
-regression test and fails above the container size or on any crashed child (set
-`ACRONIS_SKIP_LOAD_TEST=1` to skip it on a slow machine).
+wrapper and of each child is sampled every 20 ms. `npm run test:load`
+(`src/__tests__/sustained-load.test.ts`; CI runs it after the other tests, and it is not part of
+`npm test` because it needs the CPU to itself) runs it as a regression test and fails above the
+container size or on any crashed child (set `ACRONIS_SKIP_LOAD_TEST=1` to skip it).
 
 **All numbers are from macOS with Node 26. They have not been measured on Linux or in the image;
 nobody working on this had Docker.** Before trusting a size, run the image under the real limit
@@ -454,7 +455,7 @@ npm run lint && npm run typecheck && npm test && npm run build
 npm run smoke        # dual-era HTTP smoke test (after build)
 npm run gen-tools    # regenerate src/generated/tools.ts
 npm run verify-upstream  # check the pinned upstream version, lockfile integrity and the sha256 of every file it runs
-node scripts/sustained-load.mjs   # sustained-load memory check of the built wrapper (after build; see "Pool sizing")
+npm run test:load     # sustained-load memory check of the built wrapper (after build; see "Pool sizing")
 ```
 
 The integration tests spawn the real pinned package. Upstream 1.0.1 needs a token endpoint before it
