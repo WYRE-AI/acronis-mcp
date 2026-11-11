@@ -244,8 +244,13 @@ How the pool behaves at the ceiling:
   only until the new one is up, so there are never more than **max + 1** children alive (the +1 is
   that replacement, and at most one runs at a time). The close escalates (stdin EOF, 2 s, SIGTERM,
   2 s, SIGKILL; tested with a real child that ignores both) and the pool stops waiting for it after
-  8 s, so one stuck child cannot hold up every later replacement. Tested with a counting spawner
-  (30 distinct newcomers at max 2 with a slow-closing child: peak 3) and under churn.
+  8 s, so one stuck child cannot hold up every later replacement. A newcomer whose spawn **fails or
+  times out** has its child killed (SIGKILL) and the spawner waits for the process to really exit
+  before it reports the failure, so the replacement slot is not released while that child is still
+  dying (the SDK closes the transport itself on a connect timeout and a later close returns at
+  once). Tested with a counting spawner (30 distinct newcomers at max 2 with a slow-closing child:
+  peak 3), under churn, and with real children: a hung replacement spawn with a newcomer queued
+  behind it never has more than max + 1 live processes (3 before the kill-and-wait).
 - If every child is busy, or a replacement is starting, the caller waits in a queue of at most **8**
   callers, **at most 3 of them for one credential** (so one tenant's parallel callers cannot fill the
   queue and have every other tenant refused at once; a fourth caller of the same tenant is refused
@@ -256,7 +261,9 @@ How the pool behaves at the ceiling:
   calls. Before, any idle child was replaced the moment another credential waited, so tenants that
   paused for a moment between calls swapped the child back and forth, each swap a cold start (a
   token fetch and about 115 MiB, slow at 0.25 vCPU). Waiters wait for the child to age, or for
-  another to free up.
+  another to free up. One timer for the pool wakes them when it has aged, in the order they
+  arrived, so they are served in arrival order (a timer per waiter resumed them in timer order,
+  which was out of order in 20 of 300 runs of a 5-waiter test under CPU load).
 - **Turns.** A child serves its tenant without limit while nobody else waits (the fast path is
   unchanged). Once a different credential is waiting and the child has held its slot for a **time
   slice (10 s, `ACRONIS_POOL_SLICE_MS`)**, it takes no new calls: the calls already in flight or

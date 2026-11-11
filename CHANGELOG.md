@@ -61,6 +61,16 @@ under "Still open" are NOT done and must stay open until they are.
   The cost: with 10 tenants on one child only about three are served in 30 s and
   the rest get `rate_limited` (before, the swaps spread 59 calls thinly over all
   ten and refused 492). More than about three active tenants needs 1 Gi.
+- A child whose spawn fails or times out is killed (SIGKILL) and the spawner
+  waits for the process to really exit before it reports the failure. Before, the
+  SDK closed the transport itself on a connect timeout, the spawner's own close
+  returned at once, and the pool released the replacement slot while the hung
+  child was still exiting: 3 live children at max 1 (max + 1 is 2) while a
+  newcomer waited, which at 0.5 Gi risks an OOM kill.
+- Waiters are woken by one pool timer when an idle child has aged, so they
+  re-enter in the order they arrived. Before, each waiter had its own aging
+  timer and re-entered in timer order (out of order in 20 of 300 runs of the
+  reviewer's 5-waiter script under CPU load; the same script is 0 of 600 now).
 - A child that replaces an idle one has an 8 s spawn timeout, not 30 s: the idle
   child takes no new calls until the replacement is up, so a slow newcomer no
   longer holds a healthy tenant for up to 30 s.

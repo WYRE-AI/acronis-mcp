@@ -158,18 +158,20 @@ describe("UpstreamPool", () => {
   });
 
   it("reuses the busy child for the same credential instead of spawning a second one (A, B, A with max 1)", async () => {
+    vi.useFakeTimers(); // A is younger than a slice when it is released, whatever the machine's load
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 50, max: 1 }); // A is younger than a slice when it is released
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 10_000, max: 1, waitMs: 60_000 });
     let release!: () => void;
     const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
-    await new Promise((r) => setTimeout(r, 0));
+    await vi.advanceTimersByTimeAsync(0);
     const waitingB = use(pool, B);
     const secondA = use(pool, A); // queued on the existing A child (one call at a time), not a second A child
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.advanceTimersByTimeAsync(10);
     expect(spawned).toHaveLength(1);
     release();
     await held;
     await secondA;
+    await vi.advanceTimersByTimeAsync(11_000); // A has aged, so B may replace it
     await waitingB;
     expect(spawned).toHaveLength(2);
     expect(spawned.filter((s) => s.creds.clientId === "a")).toHaveLength(1);

@@ -183,6 +183,38 @@ export function resolveUpstreamBin(): string {
   return join(dirname(pkgPath), "bin", "cli.js");
 }
 
+/** The stdio transport, remembering its child's pid: the SDK drops it as soon as it starts to close. */
+class ChildTransport extends StdioClientTransport {
+  childPid: number | null = null;
+  override async start(): Promise<void> {
+    await super.start();
+    this.childPid = this.pid;
+  }
+}
+
+/**
+ * SIGKILL a child and wait until the process has really exited (bounded). A failed
+ * spawn must not leave its child alive after the pool has let go of it: the pool's
+ * process budget (max + 1) counts live processes. The SDK closes the transport itself
+ * when connect times out, so a later transport.close() returns at once and says nothing.
+ */
+async function killAndWait(pid: number | null, timeoutMs = 2_000): Promise<void> {
+  if (pid === null) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    return; // already gone
+  }
+  const alive = () => {
+    try {
+      return process.kill(pid, 0);
+    } catch {
+      return false;
+    }
+  };
+  for (const until = Date.now() + timeoutMs; alive() && Date.now() < until; ) await new Promise((r) => setTimeout(r, 20));
+}
+
 /**
  * Real spawner: Node child over stdio via @modelcontextprotocol/client.
  * `extraEnv` exists for the integration test (local token endpoint, temp HOME);
@@ -199,7 +231,7 @@ export function createStdioSpawner(
     const childHome = await mkdtemp(join(tmpdir(), "acronis-tenant-"));
     await chmod(childHome, 0o700);
     const removeHome = () => rm(childHome, { recursive: true, force: true }).catch(() => undefined);
-    const transport = new StdioClientTransport({
+    const transport = new ChildTransport({
       command: process.execPath,
       args: ["--require", EGRESS_GUARD, `--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, `--max-semi-space-size=${MAX_SEMI_SPACE_MB}`, resolveUpstreamBin()],
       env: { ...buildChildEnv(creds, toolsInclude), HOME: childHome, ...extraEnv },
@@ -218,9 +250,11 @@ export function createStdioSpawner(
       if (!closing) ctx.onClose();
     };
     try {
-      await client.connect(transport, { timeout: ctx.spawnTimeoutMs ?? spawnTimeoutMs });
+      // The pool may ask for a shorter timeout (a replacement spawn); never a longer one.
+      await client.connect(transport, { timeout: Math.min(ctx.spawnTimeoutMs ?? spawnTimeoutMs, spawnTimeoutMs) });
     } catch (err) {
       closing = true;
+      await killAndWait(transport.childPid); // the pool counts this child until it has really exited
       await transport.close().catch(() => undefined);
       await removeHome();
       const detail = stderrTail.trim().split("\n")[0]?.slice(0, 300);
@@ -411,6 +445,7 @@ export class UpstreamPool {
   private readonly closeTimeoutMs: number;
   private readonly now: () => number;
   private sweeper: NodeJS.Timeout | undefined;
+  private agingTimer: NodeJS.Timeout | undefined;
   private closed = false;
 
   constructor(opts: PoolOptions) {
@@ -583,7 +618,8 @@ export class UpstreamPool {
     const remaining = deadline - this.now();
     const own = this.waitingFor.get(key) ?? 0; // includes this caller
     if (remaining <= 0 || this.waiters.length >= this.maxQueue || own > MAX_WAITERS_PER_CREDENTIAL) throw new PoolBusyError();
-    await parkInQueue(this.waiters, Math.min(remaining, this.msUntilIdleChildMayBeReplaced() ?? remaining), signal, key);
+    this.wakeWhenAChildHasAged();
+    await parkInQueue(this.waiters, remaining, signal, key);
   }
 
   /** The error of a spawn that failed for this credential within the TTL, if any. */
@@ -614,13 +650,23 @@ export class UpstreamPool {
     return [...this.entries.values()].find((e) => e.inUse === 0 && this.now() - e.startedAt >= this.sliceMs);
   }
 
-  /** How long until the soonest idle child has been up for a slice (to look again), if there is one that has not. */
-  private msUntilIdleChildMayBeReplaced(): number | undefined {
+  /**
+   * Wake the waiters when the soonest idle child that is too young to replace has aged.
+   * One timer for the pool, not one per waiter: wake() resumes them in the order they
+   * arrived, where separate timers would resume them in timer order.
+   */
+  private wakeWhenAChildHasAged(): void {
+    if (this.agingTimer) return;
     const waits = [...this.entries.values()]
       .filter((e) => e.inUse === 0)
       .map((e) => e.startedAt + this.sliceMs - this.now())
       .filter((ms) => ms > 0);
-    return waits.length ? Math.min(...waits) : undefined;
+    if (!waits.length) return;
+    this.agingTimer = setTimeout(() => {
+      this.agingTimer = undefined;
+      this.wake();
+    }, Math.min(...waits));
+    this.agingTimer.unref();
   }
 
   private wake(): void {
@@ -746,6 +792,8 @@ export class UpstreamPool {
     this.closed = true;
     if (this.sweeper) clearInterval(this.sweeper);
     this.sweeper = undefined;
+    clearTimeout(this.agingTimer);
+    this.agingTimer = undefined;
     const all = [...this.entries.values(), ...this.draining];
     this.entries.clear();
     this.draining.clear();

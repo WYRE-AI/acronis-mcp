@@ -228,6 +228,45 @@ describe("child memory limits (real upstream child)", () => {
     expect(took).toBeLessThan(CLOSE_TIMEOUT_MS); // and the pool did not have to give up waiting
   }, 30_000);
 
+  it("a hung replacement spawn leaves no child alive once the pool has let go of it: never more than max + 1 live children while a newcomer waits behind it", async () => {
+    const silent = createServer(() => undefined); // accepts the token request and never answers
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+    const hungOrigin = `http://127.0.0.1:${(silent.address() as AddressInfo).port}`;
+    const env = (origin: string) => ({ API_BASE_URL: origin, NODE_OPTIONS: `--require ${RECORDER}`, ACRONIS_TEST_RECORD_DIR: recordDir });
+    const good = createStdioSpawner(env(fakeOrigin), { spawnTimeoutMs: 1_500 });
+    const hung = createStdioSpawner(env(hungOrigin), { spawnTimeoutMs: 1_500 });
+    const NEXT: AcronisCredentials = { ...base, clientId: "tenant-next" };
+    const HUNG: AcronisCredentials = { ...base, clientId: "tenant-hung" };
+    const pool = new UpstreamPool({
+      toolsInclude: upstreamAllowlist(false),
+      memoryLimitBytes: 512 * 1024 * 1024, // one child, so the pool may hold two while it replaces one
+      sliceMs: 500,
+      waitMs: 30_000,
+      spawner: (creds, include, ctx) => (creds.clientId === HUNG.clientId ? hung : good)(creds, include, ctx),
+    });
+    pools.push(pool);
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const earlier = new Set(records().map((r) => r.pid));
+    const live = () => records().filter((r) => !earlier.has(r.pid) && alive(r.pid)).length;
+    let peak = 0;
+    const sampler = setInterval(() => (peak = Math.max(peak, live())), 20);
+    try {
+      await call(pool, OK); // the child to be replaced
+      await sleep(700); // old enough to replace
+      const hungCall = call(pool, HUNG).catch((e: unknown) => e); // its replacement hangs, then times out
+      await sleep(200);
+      const nextCall = call(pool, NEXT); // waits behind it, then replaces the first child
+      expect(await hungCall).toBeInstanceOf(Error);
+      await nextCall;
+      await vi.waitFor(() => expect(live()).toBeLessThanOrEqual(1), { timeout: 15_000, interval: 100 });
+      expect(peak).toBeLessThanOrEqual(2); // max + 1; before: 3, the hung child still exiting when the next one started
+    } finally {
+      clearInterval(sampler);
+      silent.closeAllConnections();
+      await new Promise<void>((r) => silent.close(() => r()));
+    }
+  }, 90_000);
+
   it("kills a child that never answers initialize once the spawn timeout passes", async () => {
     const silent = createServer(() => undefined); // accepts the token request and never answers
     await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
