@@ -27,7 +27,8 @@ under "Still open" are NOT done and must stay open until they are.
   never as a partial list. A child that does not answer `initialize` within 30 s
   is killed.
 - The ceiling on children is derived from the container memory
-  (`process.constrainedMemory()`, or `ACRONIS_MEMORY_LIMIT_MB`, else 512 MiB)
+  (`process.constrainedMemory()`, else 512 MiB; `ACRONIS_MEMORY_LIMIT_MB` can
+  only lower it)
   from those peaks plus one replacement child and a 15% margin: **1 at 0.5 Gi,
   4 at 1 Gi**. At 0.5 Gi that means few concurrent tenants, cold starts and
   `rate_limited`; raising the container to 1 Gi is recommended (a Conduit
@@ -37,10 +38,29 @@ under "Still open" are NOT done and must stay open until they are.
   30 s) and is then refused with a `rate_limited` error; it never spawns an
   extra child. A caller that disconnects leaves the queue at once. One tenant
   has at most 9 calls in flight or waiting; the 10th is `rate_limited`.
-- An idle child is replaced only after its replacement has started, and the
-  victim is chosen again when the replacement is up: a tenant that called in
-  meanwhile is not retired while running, and if no child is idle the newcomer
-  is refused. There are never more than max + 1 children alive.
+- An idle child is replaced only after its replacement has started. The child
+  being replaced takes no new calls from then on (its tenant queues behind the
+  newcomer), and the replacement lasts until the old child has exited, with a
+  bounded wait (8 s; the close itself escalates stdin EOF, SIGTERM, SIGKILL), so
+  there are never more than max + 1 children alive even when a child is slow to
+  close.
+- Tenants take turns on a full pool. A child serves its tenant without limit
+  while nobody else waits; once another credential waits and the child has held
+  its slot for a time slice (10 s, `ACRONIS_POOL_SLICE_MS`), it takes no new
+  calls, its in-flight calls finish, and the slot passes to the waiters in
+  arrival order. Before, a tenant with a steady stream of calls kept its child
+  busy for ever: 2 tenants x 3 callers on one child for 45 s gave 607 calls to
+  one and 3 to the other (6 `rate_limited`, longest wait 30.1 s); now 267 and
+  223, none refused, longest call 11.3 s (macOS, Node 26).
+- `response_too_large` is returned only when the first text block of the error
+  is exactly the guard's message (`HTTP request failed: Acronis response is
+  larger than N bytes and was not read`). An upstream 400 whose body quotes that
+  text is no longer taken for it, which hid the real error.
+- `ACRONIS_MEMORY_LIMIT_MB` can only lower the memory the pool sizes for: it is
+  capped at `process.constrainedMemory()` and ignored, with a warning, when Node
+  cannot read a limit, so a wrong value cannot raise the ceiling past the
+  container. (It used to set the limit outright; where Node cannot read the
+  container's limit the pool now keeps 1 child.)
 - A failed child spawn is remembered for 30 s per credential hash (at most 256
   entries), so a bad or revoked credential cannot cause a spawn per call.
 - Host check: the Acronis base URL must be exactly one valid DNS label under

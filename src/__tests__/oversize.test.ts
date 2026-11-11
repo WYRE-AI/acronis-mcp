@@ -12,7 +12,7 @@ describe("oversize response", () => {
   it("matches exactly what the egress guard says, and its cap is the one the message states", () => {
     const cap = Number(/MAX_RESPONSE_BYTES = (\d+) \* 1024/.exec(guard)?.[1]);
     expect(cap).toBe(256);
-    expect(`Acronis response is larger than ${cap * 1024} bytes and was not read`).toMatch(OVERSIZE_PATTERN);
+    expect(`HTTP request failed: Acronis response is larger than ${cap * 1024} bytes and was not read`).toMatch(OVERSIZE_PATTERN);
     expect(oversizeMessage("acronis_fetch_all_alerts")).toContain(`${cap} KiB`);
     expect(guard).toContain("Acronis response is larger than ${MAX_RESPONSE_BYTES} bytes and was not read");
   });
@@ -37,18 +37,42 @@ describe("oversize response", () => {
   });
 
   it("recognises only an error result that carries the guard's text", () => {
-    const text = "Acronis response is larger than 262144 bytes and was not read";
+    const text = "HTTP request failed: Acronis response is larger than 262144 bytes and was not read";
     expect(isOversizeResult({ isError: true, content: [{ type: "text", text }] })).toBe(true);
     expect(isOversizeResult({ isError: false, content: [{ type: "text", text }] })).toBe(false); // data that quotes it
     expect(isOversizeResult({ isError: true, content: [{ type: "text", text: "boom" }] })).toBe(false);
     expect(isOversizeResult(undefined)).toBe(false);
   });
 
+  it("is not fooled by an upstream error whose body quotes the marker", () => {
+    const quoted = "Acronis response is larger than 262144 bytes and was not read";
+    const forged = [
+      `HTTP 400\n\n{"error":"unknown parameter: ${quoted}"}`, // a reflected request parameter
+      quoted, // marker alone, without the upstream's prefix
+      `HTTP request failed: ${quoted} and then some`, // anything after it
+      `note\nHTTP request failed: ${quoted}`, // not at the start
+      `HTTP request failed: ${quoted}\n`, // trailing text
+    ];
+    for (const text of forged) {
+      expect(isOversizeResult({ isError: true, content: [{ type: "text", text }] })).toBe(false);
+    }
+    // Only the first text block counts: a later block cannot turn an error into an oversize.
+    expect(
+      isOversizeResult({
+        isError: true,
+        content: [
+          { type: "text", text: "HTTP 400\n\nbad request" },
+          { type: "text", text: `HTTP request failed: ${quoted}` },
+        ],
+      })
+    ).toBe(false);
+  });
+
   it("is returned to the caller as response_too_large, not as an empty or partial result", async () => {
     const spawner: Spawner = async () => ({
       callTool: async () => ({
         isError: true,
-        content: [{ type: "text", text: "Acronis response is larger than 262144 bytes and was not read" }],
+        content: [{ type: "text", text: "HTTP request failed: Acronis response is larger than 262144 bytes and was not read" }],
       }),
       listToolNames: async () => [],
       close: async () => undefined,

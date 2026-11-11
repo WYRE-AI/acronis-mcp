@@ -89,7 +89,10 @@ against a real Acronis tenant, and a datacenter that redirects legitimately woul
 **An oversize response is an error, never a partial list.** The cap is on the raw HTTP body, before
 the bundle parses it, so there is no valid prefix to return, and a cut-off list that looks complete
 ("these are all the alerts") is worse than an error. The wrapper turns it into
-`{"error":{"code":"response_too_large",...}}` whose message says it is not an empty result and names the
+`{"error":{"code":"response_too_large",...}}` (recognised only when the first text block of the error is
+exactly the guard's `HTTP request failed: Acronis response is larger than N bytes and was not read`; an
+upstream 400 whose body quotes that text is passed through as the real error, tested with a real child)
+whose message says it is not an empty result and names the
 tool's own narrowing parameters, read from its input schema (`query.limit` and `query.after` to page,
 `query.tenant`, `query.tenant_id` or `query.customer_id` to scope, filters such as `query.severity`).
 Only 12 of the 34 read tools take `limit`. The two with nothing to narrow by,
@@ -194,8 +197,10 @@ A child is bounded these ways:
   **30 s** is killed.
 
 The ceiling on children is derived from the container's memory limit (`process.constrainedMemory()`,
-which reads the cgroup limit; 0, unknown or "unlimited" falls back to 512 MiB;
-`ACRONIS_MEMORY_LIMIT_MB` supplies the limit where Node cannot read it):
+which reads the cgroup limit; 0, unknown or "unlimited" falls back to 512 MiB, i.e. 1 child).
+`ACRONIS_MEMORY_LIMIT_MB` can only **lower** it: it is capped at the limit Node reads, and ignored
+(with a warning) when Node cannot read one, so a wrong value cannot size the pool past the
+container:
 
     children = clamp(floor((limit / 1.15 - 140 wrapper peak - 115 one child starting) / 130 peak per child), 1, 4)
 
@@ -210,25 +215,39 @@ starts before it evicts an idle child (below). `ACRONIS_POOL_MAX` can only lower
 value is clamped and logged).
 
 **What 1 child at 0.5 Gi means in practice: very few concurrent tenants.** A second tenant that calls
-while the first is mid-call waits up to 30 s and is then refused with `rate_limited`. With the first
-idle, the second pays a cold start (a spawn plus a token fetch, slow at 0.25 vCPU) and replaces the
-first, which pays it again on its next call. In the sustained-load run above (2 tenants, 6 callers)
-3 of 176 calls were `rate_limited` and children were started 3 times. **Recommendation: raise the
-container to 1 Gi** (4 children; no `rate_limited` in the 4-tenant run above). That is a Conduit
+while the first is mid-call waits for its turn (below), up to 30 s, and is then refused with
+`rate_limited`. Every change of tenant is a cold start (a spawn plus a token fetch, slow at 0.25
+vCPU). Two tenants that are both busy therefore **share one child, taking turns of 10 s**:
+measured with 2 tenants x 3 callers for 45 s (macOS, Node 26), tenant 0 completed 267 calls and
+tenant 1 223, none refused, the longest call 11.3 s (a slice plus a start). **Recommendation: raise
+the container to 1 Gi** (4 children; no `rate_limited` in the 4-tenant run above). That is a Conduit
 infrastructure change (`azure/vendor-fleet.bicep`), not part of this repository or this change.
 
 How the pool behaves at the ceiling:
 
-- A new credential that finds an **idle** child in a full pool spawns its child first. When that
-  child is up, the pool picks an idle victim **again** (the one chosen earlier may have been called
-  in the meantime) and evicts it (LRU). If no child is idle by then, the newcomer's child is closed
-  and the caller gets `rate_limited`: the pool does not exceed the process budget. So there are never
-  more than **max + 1** children alive (the +1 is that replacement, and at most one runs at a time),
-  a stream of bad credentials cannot flush healthy tenants' children, and a child that is running is
-  never retired. Tested with a counting spawner under churn.
+- A new credential that finds an **idle** child in a full pool spawns its child first, and the idle
+  child (LRU) is closed only when the new one is up, so a stream of bad credentials cannot flush
+  healthy tenants' children. From the moment that spawn starts the idle child takes no new calls: its
+  tenant queues behind the newcomer. **The replacement lasts until the old child has exited**, not
+  only until the new one is up, so there are never more than **max + 1** children alive (the +1 is
+  that replacement, and at most one runs at a time). The close escalates (stdin EOF, 2 s, SIGTERM,
+  2 s, SIGKILL; tested with a real child that ignores both) and the pool stops waiting for it after
+  8 s, so one stuck child cannot hold up every later replacement. Tested with a counting spawner
+  (30 distinct newcomers at max 2 with a slow-closing child: peak 3) and under churn.
 - If every child is busy, or a replacement is starting, the caller waits in a queue of at most **8**
   callers for up to **30 s**, then is refused at once with `{"error":{"code":"rate_limited",...}}`
   (the 429 case). It never spawns an extra child.
+- **Turns.** A child serves its tenant without limit while nobody else waits (the fast path is
+  unchanged). Once a different credential is waiting and the child has held its slot for a **time
+  slice (10 s, `ACRONIS_POOL_SLICE_MS`)**, it takes no new calls: the calls already in flight or
+  queued in it finish (a call is never cut off), the child goes idle, and the slot passes to the
+  waiters in the order they arrived. The tenant's later calls queue behind the waiter, and get the
+  slot back after that tenant's own slice. Without this a tenant with a steady stream of calls kept
+  its child busy for ever: before this change, 2 tenants x 3 callers on one child for 45 s gave
+  tenant 1 607 calls and tenant 0 **3** (6 `rate_limited`, longest wait 30.1 s). A waiter is served
+  within about one slice plus the calls in flight, which is why the slice is a third of the 30 s a
+  caller waits. With more tenants than children the wait is several slices, so more than about
+  three tenants per child will see `rate_limited`: that is the capacity limit, and the answer is memory.
 - A caller that disconnects (the MCP request's abort signal, tested over real HTTP) leaves every
   queue at once and frees its place.
 - A **failed spawn** (wrong or revoked credentials, no route to the datacenter) is remembered for
@@ -380,7 +399,8 @@ stored lowercase.
 | `ACRONIS_CLIENT_SECRET` | stdio and `AUTH_MODE=env` | API client secret |
 | `ACRONIS_ENABLE_WRITES` | No | `true` exposes the 3 write tools. Default `false`. |
 | `ACRONIS_POOL_MAX` | No | Max concurrent upstream children. Default and ceiling are derived from the container memory (1 at 0.5 Gi, 4 at 1 Gi); this can only lower it. See "Pool sizing". |
-| `ACRONIS_MEMORY_LIMIT_MB` | No | The container's memory limit in MiB, for runtimes where Node cannot read it (`process.constrainedMemory()` is 0). Unset: that value, or 512 MiB if unknown. |
+| `ACRONIS_MEMORY_LIMIT_MB` | No | Lowers the memory the pool sizes itself for, in MiB. Capped at the container limit Node reads (`process.constrainedMemory()`), and ignored, with a warning, when Node cannot read one (then the pool assumes 512 MiB). It can never raise the ceiling past the container. |
+| `ACRONIS_POOL_SLICE_MS` | No | How long (ms) a child serves its tenant, while another credential waits for a slot, before it takes no new calls and makes way. Default `10000`. See "Pool sizing". |
 | `ACRONIS_POOL_IDLE_MS` | No | Idle time before a child is closed. Default `600000` (10 min). |
 | `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
 | `AUTH_MODE` | No | `gateway` (Docker image and Compose default) or `env`. `env` uses `ACRONIS_*` only after S2S auth succeeds. |

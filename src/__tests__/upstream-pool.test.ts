@@ -491,47 +491,46 @@ describe("UpstreamPool", () => {
       return { spawner, stats, release: () => release() };
     }
 
-    it("picks the victim again when the replacement is up: a tenant that called in meanwhile is not retired while running", async () => {
+    it("the child being replaced takes no new calls: its tenant waits behind the newcomer, so the newcomer is served, never refused", async () => {
       const { spawner, stats, release } = countingSpawner("b");
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 2, memoryLimitBytes: 2 ** 30 });
-      await use(pool, A); // A and C idle, A the older
-      await use(pool, { ...A, clientId: "c" });
-      const b = use(pool, B); // B starts; A is the chosen victim
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, waitMs: 60_000 });
+      await use(pool, A);
+      const b = use(pool, B); // replaces A; B's spawn is held open
       await tick();
-      let releaseA!: () => void;
-      const aBusy = pool.withConnection(A, () => new Promise<void>((r) => (releaseA = r))); // A calls in while B starts
+      const ran: string[] = [];
+      const aAgain = pool.withConnection(A, async () => void ran.push("a")); // A calls in while it is being replaced
       await tick();
+      expect(ran).toEqual([]); // not served by the child that is about to close
+      expect(stats.live).toBe(2); // A still up, B starting: max + 1
       release();
-      await b;
-      await tick();
-      expect(stats.closed).toEqual(["c"]); // C, the idle one, went; A kept running
-      expect(pool.size).toBe(2);
-      expect(stats.live).toBe(2);
-      releaseA();
-      await aBusy;
+      await b; // the newcomer is served
+      await aAgain; // and A is served after it, in a child of its own
+      expect(ran).toEqual(["a"]);
+      expect(stats.closed).toEqual(["a", "b"]); // each replaced the other, in turn
+      expect(stats.peakLive).toBeLessThanOrEqual(2);
       await pool.close();
     });
 
-    it("refuses the newcomer, and closes its child, when nothing is idle by the time it is up", async () => {
-      const { spawner, stats, release } = countingSpawner("b");
+    it("leaves the victim alone when it has already gone by the time the newcomer is up", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let aExits!: () => void;
+      const closed: string[] = [];
+      const spawner: Spawner = async (creds, _include, ctx) => {
+        if (creds.clientId === "a") aExits = ctx.onClose;
+        if (creds.clientId === "b") await gate;
+        return { callTool: async () => ({}), listToolNames: async () => [], close: async () => void closed.push(creds.clientId) };
+      };
       const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
       await use(pool, A);
-      const b = use(pool, B).catch((e: unknown) => e);
+      const b = use(pool, B);
       await tick();
-      let releaseA!: () => void;
-      const aBusy = pool.withConnection(A, () => new Promise<void>((r) => (releaseA = r)));
-      await tick();
+      aExits(); // A's child exits on its own while B starts
       release();
-      expect(await b).toBeInstanceOf(PoolBusyError);
+      await b;
       await tick();
-      expect(stats.closed).toEqual(["b"]); // the newcomer's child, not the running one
-      expect(stats.live).toBe(1);
-      expect(pool.keys()).toEqual([credentialKey(A)]);
-      // The refusal says nothing about B's credential, so B may try again once A is idle.
-      releaseA();
-      await aBusy;
-      await use(pool, B);
       expect(pool.keys()).toEqual([credentialKey(B)]);
+      expect(closed).toEqual(["a"]); // closed once, by the exit, and not again
       await pool.close();
     });
 
@@ -556,6 +555,213 @@ describe("UpstreamPool", () => {
     });
   });
 
+  describe("slow-closing children", () => {
+    const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+
+    /** Counts live children from the start of a spawn to the END of its close, with a spawn and a close that each take time. */
+    function slowSpawner(spawnMs: number, closeMs: number, closeForever = false) {
+      const stats = { live: 0, peakLive: 0, spawned: 0 };
+      const spawner: Spawner = async () => {
+        stats.live++;
+        stats.spawned++;
+        stats.peakLive = Math.max(stats.peakLive, stats.live);
+        await tick(spawnMs);
+        return {
+          callTool: async () => ({}),
+          listToolNames: async () => [],
+          close: async () => {
+            if (closeForever) return new Promise<void>(() => undefined);
+            await tick(closeMs);
+            stats.live--;
+          },
+        };
+      };
+      return { spawner, stats };
+    }
+
+    it("a burst of 30 distinct newcomers at max 2 never has more than max + 1 live children (40 ms close, 30 ms spawn)", async () => {
+      const { spawner, stats } = slowSpawner(30, 40);
+      const max = 2;
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max, memoryLimitBytes: 2 ** 30, waitMs: 60_000, maxQueue: 64 });
+      const tenants = Array.from({ length: 30 }, (_, i) => ({ ...A, clientId: `burst${i}` }));
+      await Promise.all(tenants.map((t) => pool.withConnection(t, () => tick(1))));
+      expect(stats.spawned).toBe(30);
+      expect(stats.peakLive).toBeLessThanOrEqual(max + 1);
+      await pool.close();
+      expect(stats.live).toBe(0);
+    }, 30_000);
+
+    it("does not start the next replacement until the evicted child has exited", async () => {
+      const { spawner, stats } = slowSpawner(5, 200);
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, waitMs: 60_000 });
+      await use(pool, A);
+      const b = use(pool, B); // replaces A: A takes 200 ms to exit
+      await tick(50);
+      const c = use(pool, C); // must wait for A to be gone, not start another child beside A and B
+      await tick(50);
+      expect(stats.spawned).toBe(2); // A and B; C has not started
+      expect(stats.live).toBe(2); // A still closing, B up
+      await Promise.all([b, c]);
+      expect(stats.peakLive).toBeLessThanOrEqual(2);
+      await pool.close();
+    });
+
+    it("stops waiting for a close that never returns, so one stuck child cannot block every later replacement", async () => {
+      const { spawner, stats } = slowSpawner(5, 0, true);
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, closeTimeoutMs: 50, waitMs: 60_000 });
+      await use(pool, A);
+      const started = Date.now();
+      await use(pool, B); // A's close never returns
+      await use(pool, C); // and C still gets through, after B's replacement ended at the timeout
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(stats.spawned).toBe(3);
+      await pool.close();
+    });
+  });
+
+  describe("fairness between tenants", () => {
+    const SLICE = 10_000;
+    const CALL_MS = 100;
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+    /** A fake spawner that records which tenant each child was started for, in order. */
+    function recordingSpawner() {
+      const started: string[] = [];
+      const spawner: Spawner = async (creds) => {
+        started.push(creds.clientId);
+        return { callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined };
+      };
+      return { spawner, started };
+    }
+
+    interface Tally {
+      ok: number;
+      busy: number;
+      firstOkAt?: number;
+      worstMs: number;
+    }
+
+    /** `callers` loops calling back to back (each call CALL_MS long) until `until`; results tallied. */
+    function hammer(pool: UpstreamPool, tenant: AcronisCredentials, callers: number, until: number): Tally {
+      const tally: Tally = { ok: 0, busy: 0, worstMs: 0 };
+      for (let i = 0; i < callers; i++) {
+        void (async () => {
+          while (Date.now() < until) {
+            const began = Date.now();
+            try {
+              await pool.withConnection(tenant, () => sleep(CALL_MS));
+              tally.ok++;
+              tally.firstOkAt ??= Date.now();
+              tally.worstMs = Math.max(tally.worstMs, Date.now() - began);
+            } catch (e) {
+              if (!(e instanceof PoolBusyError)) throw e;
+              tally.busy++;
+            }
+          }
+        })();
+      }
+      return tally;
+    }
+
+    it("a tenant with a steady stream of calls cannot keep another out: both are served, taking turns (the reviewer's repro: 2 tenants x 3 callers, ceiling 1, 45 s)", async () => {
+      vi.useFakeTimers();
+      const { spawner, started } = recordingSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: SLICE, waitMs: 30_000 });
+      const t0 = Date.now();
+      const end = t0 + 45_000;
+      const a = hammer(pool, A, 3, end);
+      await vi.advanceTimersByTimeAsync(1_000);
+      const bFrom = Date.now();
+      const b = hammer(pool, B, 3, end);
+      await vi.advanceTimersByTimeAsync(44_000 + 2_000); // past the end, so the last calls finish
+      // B is served within about one time slice plus one call of A having the slot, not never.
+      expect(b.firstOkAt).toBeDefined();
+      expect(b.firstOkAt! - bFrom).toBeLessThanOrEqual(SLICE + 3 * CALL_MS + CALL_MS);
+      // Neither is refused, and each makes real progress (before the fix: A 868 calls, B 3 and a 30 s wait).
+      expect(a.busy).toBe(0);
+      expect(b.busy).toBe(0);
+      expect(a.ok).toBeGreaterThan(100);
+      expect(b.ok).toBeGreaterThan(100);
+      // Nobody waits much longer than the other's slice (plus a start and the calls in flight).
+      expect(a.worstMs).toBeLessThanOrEqual(SLICE + 1_500);
+      expect(b.worstMs).toBeLessThanOrEqual(SLICE + 1_500);
+      // They alternate: a child per turn, A, B, A, B, ...
+      expect(started.length).toBeGreaterThanOrEqual(4);
+      started.forEach((id, i) => expect(id).toBe(i % 2 === 0 ? "a" : "b"));
+      await pool.close();
+    });
+
+    it("keeps the fast path when nobody waits: a lone tenant is never asked to make way, however long it runs", async () => {
+      vi.useFakeTimers();
+      const { spawner, started } = recordingSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: SLICE });
+      const a = hammer(pool, A, 3, Date.now() + 60_000);
+      await vi.advanceTimersByTimeAsync(62_000);
+      expect(started).toEqual(["a"]); // one child, six slices long, never respawned
+      expect(a.busy).toBe(0);
+      expect(a.ok).toBeGreaterThan(550); // one call at a time, 10 a second
+      await pool.close();
+    });
+
+    it("never interrupts a call: a call still running when its slice ends finishes, and the waiter starts after it", async () => {
+      vi.useFakeTimers();
+      const { spawner, started } = recordingSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: SLICE, waitMs: 60_000 });
+      const log: string[] = [];
+      const long = pool.withConnection(A, async () => {
+        await sleep(SLICE + 5_000); // runs past its own slice
+        log.push("a call done");
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      const b = pool.withConnection(B, async () => log.push("b call"));
+      await vi.advanceTimersByTimeAsync(SLICE + 10_000);
+      await Promise.all([long, b]);
+      expect(log).toEqual(["a call done", "b call"]);
+      expect(started).toEqual(["a", "b"]);
+      await pool.close();
+    });
+
+    it("hands the slot to the waiters in the order they arrived", async () => {
+      const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+      const { spawner, started } = recordingSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: 1_000_000, waitMs: 60_000 });
+      let release!: () => void;
+      const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
+      await tick(0);
+      const served: string[] = [];
+      const waiting: Array<Promise<void>> = [];
+      for (const id of ["b", "c", "d", "e"]) {
+        waiting.push(pool.withConnection({ ...A, clientId: id }, async () => void served.push(id)));
+        await tick(5); // arrive one after the other
+      }
+      await tick(20);
+      release();
+      await held;
+      await Promise.all(waiting);
+      expect(started).toEqual(["a", "b", "c", "d", "e"]);
+      expect(served).toEqual(["b", "c", "d", "e"]);
+      await pool.close();
+    });
+
+    it("with room for two children, a third tenant gets in once either of them has had its slice", async () => {
+      vi.useFakeTimers();
+      const { spawner, started } = recordingSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 2, memoryLimitBytes: 2 ** 30, sliceMs: SLICE, waitMs: 30_000 });
+      const end = Date.now() + 30_000;
+      const a = hammer(pool, A, 2, end);
+      const b = hammer(pool, B, 2, end);
+      await vi.advanceTimersByTimeAsync(500);
+      const cFrom = Date.now();
+      const c = hammer(pool, { ...A, clientId: "c" }, 2, end);
+      await vi.advanceTimersByTimeAsync(32_000);
+      expect(c.firstOkAt! - cFrom).toBeLessThanOrEqual(SLICE + 1_000);
+      expect([a.busy, b.busy, c.busy]).toEqual([0, 0, 0]);
+      expect(Math.min(a.ok, b.ok, c.ok)).toBeGreaterThan(50);
+      expect(started.slice(0, 3)).toEqual(["a", "b", "c"]);
+      await pool.close();
+    });
+  });
+
   it("close() closes every child and refuses further use", async () => {
     const { spawner, spawned } = fakeSpawner();
     const pool = new UpstreamPool({ toolsInclude: [], spawner });
@@ -569,15 +775,65 @@ describe("UpstreamPool", () => {
 });
 
 describe("poolOptionsFromEnv", () => {
-  it("leaves max to the memory ceiling and defaults idle to 10 minutes; honours overrides", () => {
-    expect(poolOptionsFromEnv({})).toEqual({ max: undefined, idleMs: 600_000 });
-    expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "5", ACRONIS_POOL_IDLE_MS: "1000" })).toEqual({ max: 5, idleMs: 1000 });
-    expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "abc", ACRONIS_POOL_IDLE_MS: "-3" })).toEqual({ max: undefined, idleMs: 600_000 });
+  const MiB = 1024 * 1024;
+
+  it("leaves max to the memory ceiling, defaults idle to 10 minutes and the time slice to 10 s; honours overrides", () => {
+    expect(poolOptionsFromEnv({}, 0)).toEqual({ max: undefined, idleMs: 600_000, sliceMs: 10_000 });
+    expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "5", ACRONIS_POOL_IDLE_MS: "1000", ACRONIS_POOL_SLICE_MS: "2000" }, 0)).toEqual({
+      max: 5,
+      idleMs: 1000,
+      sliceMs: 2000,
+    });
+    expect(poolOptionsFromEnv({ ACRONIS_POOL_MAX: "abc", ACRONIS_POOL_IDLE_MS: "-3", ACRONIS_POOL_SLICE_MS: "x" }, 0)).toEqual({
+      max: undefined,
+      idleMs: 600_000,
+      sliceMs: 10_000,
+    });
   });
 
-  it("takes the container memory from ACRONIS_MEMORY_LIMIT_MB when the runtime cannot report it", () => {
-    expect(poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "1024" }).memoryLimitBytes).toBe(1024 * 1024 * 1024);
-    expect(poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "0" }).memoryLimitBytes).toBeUndefined();
+  describe("ACRONIS_MEMORY_LIMIT_MB can only lower the memory the pool sizes itself for", () => {
+    it("is capped at the container's limit when Node can read it: 4096 in a 0.5 Gi container is 0.5 Gi", () => {
+      const o = poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "4096" }, 512 * MiB);
+      expect(o.memoryLimitBytes).toBe(512 * MiB);
+      expect(poolCeilingForMemory(o.memoryLimitBytes)).toBe(1); // not 4
+    });
+
+    it("lowers the limit when it is below the container's", () => {
+      const o = poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "512" }, 1024 * MiB);
+      expect(o.memoryLimitBytes).toBe(512 * MiB);
+      expect(poolCeilingForMemory(o.memoryLimitBytes)).toBe(1);
+    });
+
+    it("leaves the container's own limit alone when unset", () => {
+      expect(poolOptionsFromEnv({}, 1024 * MiB).memoryLimitBytes).toBeUndefined(); // the pool reads the same limit itself
+    });
+
+    it("is ignored when Node cannot read a limit (unknown, 0 or the cgroup 'no limit'): the pool keeps its 1 child", () => {
+      for (const unreadable of [undefined, 0, 2 ** 60, Number.NaN]) {
+        const o = poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "4096" }, unreadable);
+        expect(o.memoryLimitBytes).toBeUndefined();
+        expect(poolCeilingForMemory(o.memoryLimitBytes ?? unreadable)).toBe(1);
+      }
+    });
+
+    it("ignores a value that is not a positive number", () => {
+      expect(poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "0" }, 1024 * MiB).memoryLimitBytes).toBeUndefined();
+      expect(poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "lots" }, 1024 * MiB).memoryLimitBytes).toBeUndefined();
+    });
+
+    it("sizes a real pool from the capped value, never from the raw one", async () => {
+      const { spawner } = fakeSpawner();
+      const o = poolOptionsFromEnv({ ACRONIS_MEMORY_LIMIT_MB: "4096" }, 512 * MiB);
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, ...o, waitMs: 5 });
+      const releases: Array<() => void> = [];
+      const held = [A, B].map((c) => pool.withConnection(c, () => new Promise<void>((r) => releases.push(r))).catch((e: unknown) => e));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(releases).toHaveLength(1); // one child at 0.5 Gi, the second tenant is refused
+      expect((await held[1]) instanceof PoolBusyError).toBe(true);
+      releases[0]!();
+      await held[0];
+      await pool.close();
+    });
   });
 });
 

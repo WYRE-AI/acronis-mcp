@@ -18,15 +18,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AcronisCredentials } from "../credentials.js";
+import { handleToolCall, type ServerDeps } from "../mcp-server.js";
 import { isOversizeResult } from "../oversize.js";
 import { upstreamAllowlist } from "../tiers.js";
-import { CHILD_MAX_OLD_SPACE_MB, MAX_SEMI_SPACE_MB, UpstreamPool, createStdioSpawner, credentialKey } from "../upstream-pool.js";
+import { CHILD_MAX_OLD_SPACE_MB, CLOSE_TIMEOUT_MS, MAX_SEMI_SPACE_MB, UpstreamPool, createStdioSpawner, credentialKey } from "../upstream-pool.js";
 
 const RECORDER = new URL("./fixtures/record-child.cjs", import.meta.url).pathname;
 const base = { baseUrl: "https://eu8-cloud.acronis.com", clientSecret: "dummy-secret" };
 const BIG: AcronisCredentials = { ...base, clientId: "tenant-big" };
 const OK: AcronisCredentials = { ...base, clientId: "tenant-ok" };
 const SIZED: AcronisCredentials = { ...base, clientId: "tenant-sized" };
+const REFLECT: AcronisCredentials = { ...base, clientId: "tenant-reflect" };
+/** What a real Acronis 400 might echo back from the request, and what the egress guard says. */
+const MARKER = "Acronis response is larger than 262144 bytes and was not read";
 /** A response just under the cap, as a list of small objects the way Acronis returns them. */
 const NEAR_CAP_BODY = JSON.stringify({
   items: Array.from({ length: 1_600 }, (_, i) => ({ id: `${i}`.padStart(36, "0"), message: "x".repeat(100) })),
@@ -69,6 +73,11 @@ beforeAll(async () => {
       }
       const bearer = String(req.headers.authorization ?? "").replace(/^Bearer /i, "");
       const claims = bearer ? JSON.parse(Buffer.from(bearer.split(".")[1] ?? "", "base64url").toString("utf8") || "{}") : {};
+      if (claims.cid === REFLECT.clientId && !req.url?.includes("resolve_ids")) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: { message: `invalid filter: ${MARKER}` } }));
+        return;
+      }
       if (claims.cid === SIZED.clientId && !req.url?.includes("resolve_ids")) {
         res.end(NEAR_CAP_BODY);
         return;
@@ -154,6 +163,24 @@ describe("child memory limits (real upstream child)", () => {
     expect(alive(pidOf(OK))).toBe(true);
   }, 60_000);
 
+  it("tells a genuine oversize from an upstream 400 that quotes the marker, with the real child", async () => {
+    const pool = newPool();
+    const deps: ServerDeps = { writes: false, pool };
+    // Genuine: the guard aborted the response, so the model is told to ask for less.
+    const genuine = await handleToolCall(deps, BIG, "acronis_fetch_all_alerts", {});
+    expect(JSON.parse(genuine.content[0].text).error.code).toBe("response_too_large");
+    // Forged: the 400 body echoes the marker. It must come through as the real upstream error.
+    const raw = await call(pool, REFLECT);
+    expect(raw.isError).toBe(true);
+    expect(JSON.stringify(raw)).toContain(MARKER); // the marker really is in the result...
+    expect(isOversizeResult(raw)).toBe(false); // ...and still is not taken for an oversize
+    const reflected = await handleToolCall(deps, REFLECT, "acronis_fetch_all_alerts", {});
+    expect(reflected.isError).toBe(true);
+    const error = JSON.parse(reflected.content[0].text).error;
+    expect(error.code).toBe("upstream_error"); // the real error, not response_too_large
+    expect(error.message).toMatch(/^HTTP 400/);
+  }, 60_000);
+
   it("runs several calls that each return nearly the cap one at a time in the same child, and the child survives", async () => {
     expect(NEAR_CAP_BODY.length).toBeGreaterThan(200 * 1024);
     expect(NEAR_CAP_BODY.length).toBeLessThan(256 * 1024);
@@ -187,6 +214,19 @@ describe("child memory limits (real upstream child)", () => {
     expect(bigPids).toHaveLength(2); // the dead child and its replacement
     expect(new Set(bigPids).size).toBe(2);
   }, 90_000);
+
+  it("closing a child that ignores EOF and SIGTERM ends in SIGKILL, within the pool's close bound", async () => {
+    const pool = newPool({ ACRONIS_TEST_IMMORTAL: "1" });
+    await pool.withConnection(OK, (c) => c.listToolNames());
+    const pid = pidOf(OK);
+    expect(alive(pid)).toBe(true);
+    const started = Date.now();
+    await pool.close(); // stdin EOF (2 s), SIGTERM (2 s), then SIGKILL
+    const took = Date.now() - started;
+    await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 5_000, interval: 50 });
+    expect(took).toBeGreaterThanOrEqual(3_500); // it really held out against EOF and SIGTERM
+    expect(took).toBeLessThan(CLOSE_TIMEOUT_MS); // and the pool did not have to give up waiting
+  }, 30_000);
 
   it("kills a child that never answers initialize once the spawn timeout passes", async () => {
     const silent = createServer(() => undefined); // accepts the token request and never answers

@@ -22,8 +22,15 @@ import { tmpdir } from "node:os";
  * poolCeilingForMemory turns those peaks into a child count with a 15% margin:
  * 1 child at 0.5 Gi (the fleet today, azure/vendor-fleet.bicep `memory`), 4 at
  * 1 Gi. The pool is never above max children plus the one replacement that
- * starts before an idle child is evicted. Beyond that a new credential waits in a
- * short, bounded queue and is then refused with PoolBusyError; it never spawns.
+ * starts before an idle child is evicted, and that replacement is counted until the
+ * evicted child has actually exited. Beyond that a new credential waits in a short,
+ * bounded queue and is then refused with PoolBusyError; it never spawns.
+ *
+ * Fairness: a child serves its tenant freely while nobody else waits. Once another
+ * credential is waiting for a slot and the child has held its slot for a time slice
+ * (DEFAULT_POOL_SLICE_MS), it takes no NEW calls; its in-flight calls finish, it goes
+ * idle, and the slot passes to the waiters in arrival order. Without this a tenant
+ * with a steady stream of calls keeps its child busy for ever and nobody else gets in.
  */
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -65,6 +72,19 @@ export const DEFAULT_POOL_IDLE_MS = 10 * 60 * 1000;
 export const DEFAULT_POOL_WAIT_MS = 30_000;
 /** At most this many callers wait for a slot; the next one is refused at once. */
 export const DEFAULT_POOL_MAX_QUEUE = 8;
+/**
+ * How long a child serves its tenant before it must make way for a waiting
+ * credential. A swap costs a child start (token fetch, ~115 MiB), so the slice is
+ * long enough to amortise it and short enough that a waiter is served well inside
+ * DEFAULT_POOL_WAIT_MS.
+ */
+export const DEFAULT_POOL_SLICE_MS = 10_000;
+/**
+ * How long the pool waits for a child to finish closing. The stdio transport already
+ * escalates (stdin EOF, 2 s, SIGTERM, 2 s, SIGKILL), so this only bounds a close
+ * that never returns, so one stuck child cannot hold up every later replacement.
+ */
+export const CLOSE_TIMEOUT_MS = 8_000;
 /**
  * A failed spawn (revoked or wrong credentials, no route) is remembered for
  * this long, keyed by the credential hash, so a bad credential cannot cause a
@@ -227,18 +247,28 @@ export function setDefaultSpawner(spawner: Spawner | undefined): void {
   defaultSpawner = spawner ?? spawnUpstream;
 }
 
+/** A caller parked in a queue. `key` is its credential (empty for a call slot). */
+interface Waiter {
+  key: string;
+  wake: () => void;
+}
+
 interface Entry {
   key: string;
   conn: Promise<UpstreamConnection>;
+  /** When the child was created; its time slice runs from here. */
+  startedAt: number;
   lastUsed: number;
   /** Callers holding this entry: running a call, or waiting for a call slot. */
   inUse: number;
   /** Calls running in the child right now (at most MAX_CALLS_PER_CHILD). */
   running: number;
   /** Callers waiting for a call slot in this child. */
-  callWaiters: Array<() => void>;
+  callWaiters: Waiter[];
   /** Removed from the map; close once inUse hits zero. */
   retired: boolean;
+  /** Set when the close starts, so closing twice (eviction, then shutdown) is one close. */
+  closing?: Promise<void>;
 }
 
 /** The pool is full of busy children and the wait queue is full or timed out (a 429). */
@@ -263,6 +293,10 @@ export interface PoolOptions {
   maxQueue?: number;
   /** How long a failed spawn is remembered. */
   failedSpawnTtlMs?: number;
+  /** How long a child serves its tenant, while others wait, before it takes no new calls. */
+  sliceMs?: number;
+  /** How long to wait for a child to finish closing before moving on. */
+  closeTimeoutMs?: number;
   now?: () => number;
 }
 
@@ -271,14 +305,27 @@ function positiveInt(raw: string | undefined): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+/**
+ * Pool options from the environment. ACRONIS_MEMORY_LIMIT_MB can only LOWER the
+ * memory the pool sizes itself for: it is capped at the limit Node reads from the
+ * container (`constrainedMemory`), and ignored when Node cannot read one, in which
+ * case the pool keeps the conservative 512 MiB (one child). So a wrong value cannot
+ * raise the ceiling past what the container has.
+ */
 export function poolOptionsFromEnv(
-  env: Record<string, string | undefined> = process.env
-): { max: number | undefined; idleMs: number; memoryLimitBytes?: number } {
-  const memoryLimitMb = positiveInt(env.ACRONIS_MEMORY_LIMIT_MB);
+  env: Record<string, string | undefined> = process.env,
+  constrainedMemory: number | undefined = process.constrainedMemory()
+): { max: number | undefined; idleMs: number; sliceMs: number; memoryLimitBytes?: number } {
+  const requestedMb = positiveInt(env.ACRONIS_MEMORY_LIMIT_MB);
+  const known = constrainedMemory !== undefined && constrainedMemory > 0 && constrainedMemory < 2 ** 50;
+  if (requestedMb && !known) {
+    logger.warn("ACRONIS_MEMORY_LIMIT_MB ignored: the container's memory limit cannot be read, so the pool assumes 512 MiB");
+  }
   return {
     max: positiveInt(env.ACRONIS_POOL_MAX),
     idleMs: positiveInt(env.ACRONIS_POOL_IDLE_MS) ?? DEFAULT_POOL_IDLE_MS,
-    ...(memoryLimitMb ? { memoryLimitBytes: memoryLimitMb * 1024 * 1024 } : {}),
+    sliceMs: positiveInt(env.ACRONIS_POOL_SLICE_MS) ?? DEFAULT_POOL_SLICE_MS,
+    ...(requestedMb && known ? { memoryLimitBytes: Math.min(requestedMb * 1024 * 1024, constrainedMemory) } : {}),
   };
 }
 
@@ -287,18 +334,21 @@ export function poolOptionsFromEnv(
  * aborts (rejects). Leaving the queue is immediate in every case, so a caller
  * that disconnected never holds a queue place.
  */
-function parkInQueue(queue: Array<() => void>, ms: number, signal?: AbortSignal): Promise<"woken" | "timeout"> {
+function parkInQueue(queue: Waiter[], ms: number, signal?: AbortSignal, key = ""): Promise<"woken" | "timeout"> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason ?? new Error("Request aborted"));
     const leave = () => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      const i = queue.indexOf(wake);
+      const i = queue.indexOf(waiter);
       if (i >= 0) queue.splice(i, 1);
     };
-    const wake = () => {
-      leave();
-      resolve("woken");
+    const waiter: Waiter = {
+      key,
+      wake: () => {
+        leave();
+        resolve("woken");
+      },
     };
     const onAbort = () => {
       leave();
@@ -310,7 +360,7 @@ function parkInQueue(queue: Array<() => void>, ms: number, signal?: AbortSignal)
     }, ms);
     timer.unref?.();
     signal?.addEventListener("abort", onAbort, { once: true });
-    queue.push(wake);
+    queue.push(waiter);
   });
 }
 
@@ -318,10 +368,21 @@ export class UpstreamPool {
   private readonly entries = new Map<string, Entry>(); // insertion order == LRU order
   /** Retired children still serving a call; closed when their last call ends (and on shutdown). */
   private readonly draining = new Set<Entry>();
-  /** Callers waiting for a free pool slot (every indexed child busy, or a replacement spawning). */
-  private readonly waiters: Array<() => void> = [];
-  /** A new child is starting in place of an idle one, so the pool is briefly one over max. At most one. */
-  private replacing = false;
+  /** Callers parked until the pool changes (every indexed child busy, or a replacement spawning), oldest first. */
+  private readonly waiters: Waiter[] = [];
+  /**
+   * Credentials with a caller still looking for a slot, and how many: parked, or
+   * woken and not yet through. Kept apart from `waiters`, because waking empties that
+   * queue before the woken callers have run, and a child must not read that as "nobody waits".
+   */
+  private readonly waitingFor = new Map<string, number>();
+  /**
+   * The child a new one is replacing, from the moment the new child starts until
+   * the old one has exited. The pool is one over max for that time, so at most one.
+   */
+  private replacementVictim: Entry | undefined;
+  /** The victim's close, which ends the replacement. Only meaningful while replacementVictim is set. */
+  private victimClosing: Promise<void> = Promise.resolve();
   /** Failed spawns by credential key (insertion order == age), kept for failedSpawnTtlMs. */
   private readonly failedSpawns = new Map<string, { until: number; error: Error }>();
   private readonly waitMs: number;
@@ -331,6 +392,8 @@ export class UpstreamPool {
   private readonly toolsInclude: readonly string[];
   private readonly max: number;
   private readonly idleMs: number;
+  private readonly sliceMs: number;
+  private readonly closeTimeoutMs: number;
   private readonly now: () => number;
   private sweeper: NodeJS.Timeout | undefined;
   private closed = false;
@@ -345,6 +408,8 @@ export class UpstreamPool {
       logger.warn("Pool max clamped to what the container's memory allows", { requested: requestedMax, max: this.max });
     }
     this.idleMs = opts.idleMs ?? DEFAULT_POOL_IDLE_MS;
+    this.sliceMs = opts.sliceMs ?? DEFAULT_POOL_SLICE_MS;
+    this.closeTimeoutMs = opts.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
     this.waitMs = opts.waitMs ?? DEFAULT_POOL_WAIT_MS;
     this.maxQueue = opts.maxQueue ?? DEFAULT_POOL_MAX_QUEUE;
     this.failedSpawnTtlMs = opts.failedSpawnTtlMs ?? FAILED_SPAWN_TTL_MS;
@@ -407,7 +472,7 @@ export class UpstreamPool {
 
   private leaveCall(entry: Entry): void {
     const next = entry.callWaiters.shift();
-    if (next) next();
+    if (next) next.wake();
     else entry.running--;
   }
 
@@ -417,34 +482,80 @@ export class UpstreamPool {
    * credential waits for a slot (up to waitMs), then fails with PoolBusyError.
    * When the pool is full but a child is idle, the new child spawns first and
    * the idle one is evicted only once the new one is up (see create).
+   *
+   * A caller for a child that must make way (see mustYield) waits like a new
+   * credential, behind whoever is already waiting.
    */
   private async acquire(key: string, creds: AcronisCredentials, signal?: AbortSignal): Promise<Entry> {
     const deadline = this.now() + this.waitMs;
-    for (;;) {
-      signal?.throwIfAborted();
-      if (this.closed) throw new Error("Upstream pool is closed");
-      const existing = this.entries.get(key);
-      if (existing) {
-        // refresh LRU position
-        this.entries.delete(key);
-        this.entries.set(key, existing);
-        existing.lastUsed = this.now();
-        existing.inUse++;
-        return existing;
+    let waiting = false;
+    try {
+      for (;;) {
+        signal?.throwIfAborted();
+        if (this.closed) throw new Error("Upstream pool is closed");
+        const existing = this.entries.get(key);
+        if (existing) {
+          if (!this.mustYield(existing)) {
+            // refresh LRU position
+            this.entries.delete(key);
+            this.entries.set(key, existing);
+            existing.lastUsed = this.now();
+            existing.inUse++;
+            return existing;
+          }
+        } else {
+          const failed = this.recentSpawnFailure(key);
+          if (failed) throw failed;
+          const room = this.entries.size < this.max;
+          const victim = room || this.replacementVictim ? undefined : this.leastRecentlyUsedIdle();
+          if (room || victim) {
+            const entry = this.create(key, creds, victim);
+            entry.inUse++;
+            return entry;
+          }
+        }
+        if (!waiting) {
+          waiting = true;
+          this.waitingFor.set(key, (this.waitingFor.get(key) ?? 0) + 1);
+        }
+        await this.waitForSlot(key, deadline, signal); // woken or timed out: look again
       }
-      const failed = this.recentSpawnFailure(key);
-      if (failed) throw failed;
-      const room = this.entries.size < this.max;
-      const victim = room || this.replacing ? undefined : this.leastRecentlyUsedIdle();
-      if (room || victim) {
-        const entry = this.create(key, creds, victim);
-        entry.inUse++;
-        return entry;
+    } catch (error) {
+      if (waiting) {
+        waiting = false;
+        this.stopWaiting(key);
+        this.wake(); // gave up (busy, disconnected, bad credential): callers that stood back for this one can look again
       }
-      const remaining = deadline - this.now();
-      if (remaining <= 0 || this.waiters.length >= this.maxQueue) throw new PoolBusyError();
-      await parkInQueue(this.waiters, remaining, signal); // woken or timed out: look again
+      throw error;
+    } finally {
+      if (waiting) this.stopWaiting(key);
     }
+  }
+
+  private stopWaiting(key: string): void {
+    const left = (this.waitingFor.get(key) ?? 1) - 1;
+    if (left > 0) this.waitingFor.set(key, left);
+    else this.waitingFor.delete(key);
+  }
+
+  /**
+   * Is this child to take no new calls? Yes when it is the child being replaced,
+   * and yes once it has held its slot for a time slice and a different credential
+   * is waiting for one. Its in-flight calls finish, so it goes idle and the slot
+   * can pass. Otherwise, and always when nobody waits, a child serves its tenant
+   * without limit.
+   */
+  private mustYield(entry: Entry): boolean {
+    if (this.replacementVictim === entry) return true;
+    if (this.now() - entry.startedAt < this.sliceMs) return false;
+    return [...this.waitingFor.keys()].some((k) => k !== entry.key);
+  }
+
+  /** Park until the pool changes, or fail with PoolBusyError if the queue is full or the deadline has passed. */
+  private async waitForSlot(key: string, deadline: number, signal?: AbortSignal): Promise<void> {
+    const remaining = deadline - this.now();
+    if (remaining <= 0 || this.waiters.length >= this.maxQueue) throw new PoolBusyError();
+    await parkInQueue(this.waiters, remaining, signal, key);
   }
 
   /** The error of a spawn that failed for this credential within the TTL, if any. */
@@ -471,22 +582,23 @@ export class UpstreamPool {
   }
 
   private wake(): void {
-    for (const w of this.waiters.splice(0)) w();
+    for (const w of this.waiters.splice(0)) w.wake();
   }
 
   /**
-   * Spawn the child for key. With a `victim` (the pool is full), an idle child
-   * is evicted only after this spawn succeeds, so a stream of bad or varying
+   * Spawn the child for key. With a `victim` (the pool is full), the idle child
+   * is closed only after this spawn succeeds, so a stream of bad or varying
    * credentials, whose spawns fail, cannot push healthy tenants' idle children
-   * out. The victim is chosen again when the spawn finishes, because the one
-   * picked earlier may have been called in the meantime; if no child is idle by
-   * then, the newcomer is refused (and its child closed) rather than exceed the
-   * process budget. So the pool is never above max children plus this one
-   * replacement, and `replacing` keeps it to one.
+   * out. From the moment the spawn starts the victim takes no new calls (see
+   * mustYield): its callers wait for a slot like a new credential, behind the
+   * newcomer, so the victim is still idle when the newcomer is up. So the pool is
+   * never above max children plus this one replacement, and `replacementVictim`
+   * keeps it to one, until the victim has exited.
    */
   private create(key: string, creds: AcronisCredentials, victim?: Entry): Entry {
     const entry: Entry = {
       key,
+      startedAt: this.now(),
       lastUsed: this.now(),
       inUse: 0,
       running: 0,
@@ -497,21 +609,21 @@ export class UpstreamPool {
     const spawned = this.spawner(creds, this.toolsInclude, {
       onClose: () => this.drop(entry),
     });
-    entry.conn = victim ? spawned.then((conn) => this.evictForReplacement(entry, victim, conn)) : spawned;
+    entry.conn = victim ? spawned.then((conn) => this.closeVictim(victim, conn)) : spawned;
     entry.conn.catch((error: unknown) => {
       this.drop(entry);
       // Remember a failed spawn briefly so a bad credential cannot respawn on every call.
-      // A refusal for lack of an idle child to replace says nothing about the credential.
-      if (!(error instanceof PoolBusyError)) {
-        this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
-      }
+      this.rememberSpawnFailure(key, error instanceof Error ? error : new Error(String(error)));
     });
     if (victim) {
-      this.replacing = true;
+      // The replacement ends when the newcomer is up (or failed) AND the old child has exited.
+      this.replacementVictim = victim;
       entry.conn
         .catch(() => undefined)
+        .then(() => this.victimClosing)
         .then(() => {
-          this.replacing = false;
+          this.replacementVictim = undefined;
+          this.victimClosing = Promise.resolve();
           this.wake();
         });
     }
@@ -521,21 +633,13 @@ export class UpstreamPool {
     return entry;
   }
 
-  /** The newcomer's child is up: make room by closing an idle child, or refuse the newcomer. */
-  private async evictForReplacement(
-    newcomer: Entry,
-    preferred: Entry,
-    conn: UpstreamConnection
-  ): Promise<UpstreamConnection> {
-    if (this.entries.size <= this.max) return conn; // an idle sweep or a child exit already made room
-    const idle = (e: Entry) => e !== newcomer && e.inUse === 0 && this.entries.get(e.key) === e;
-    const victim = idle(preferred) ? preferred : [...this.entries.values()].find(idle);
-    if (!victim) {
-      await conn.close().catch(() => undefined);
-      throw new PoolBusyError();
+  /** The newcomer's child is up: close the idle child it replaces, unless a sweep or a child exit already made room. */
+  private closeVictim(victim: Entry, conn: UpstreamConnection): UpstreamConnection {
+    if (this.entries.size > this.max) {
+      logger.debug("Upstream child evicted (LRU)", { poolKey: victim.key.slice(0, 12) });
+      this.drop(victim);
+      this.victimClosing = this.closeEntry(victim); // the same close drop started
     }
-    logger.debug("Upstream child evicted (LRU)", { poolKey: victim.key.slice(0, 12) });
-    this.drop(victim);
     return conn;
   }
 
@@ -569,13 +673,29 @@ export class UpstreamPool {
     this.sweeper.unref();
   }
 
-  private async closeEntry(entry: Entry): Promise<void> {
-    try {
-      const conn = await entry.conn;
-      await conn.close();
-    } catch {
-      /* spawn failed or already closed */
-    }
+  /** Close the entry's child, once. Resolves when it has closed, or after closeTimeoutMs if it never does. */
+  private closeEntry(entry: Entry): Promise<void> {
+    entry.closing ??= (async () => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        const conn = await entry.conn;
+        await Promise.race([
+          conn.close(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(() => {
+              logger.warn("Upstream child did not close in time", { poolKey: entry.key.slice(0, 12) });
+              resolve();
+            }, this.closeTimeoutMs);
+            timer.unref();
+          }),
+        ]);
+      } catch {
+        /* spawn failed or already closed */
+      } finally {
+        clearTimeout(timer);
+      }
+    })();
+    return entry.closing;
   }
 
   /** Close every child (shutdown). */

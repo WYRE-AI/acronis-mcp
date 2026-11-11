@@ -11,11 +11,20 @@
  */
 import { GENERATED_TOOLS } from "./generated/tools.js";
 
-/** The text the child's egress guard fails with. Matched, not parsed: it comes through the upstream's error text. */
-export const OVERSIZE_PATTERN = /Acronis response is larger than \d+ bytes and was not read/;
+/**
+ * What the upstream returns when the child's egress guard aborts a response: the
+ * guard throws "Acronis response is larger than N bytes and was not read" from
+ * `fetch`, and the upstream reports a failed request as `HTTP request failed: <message>`.
+ * Anchored to the whole first text block: a real upstream error starts with
+ * `HTTP <status>` and carries the response body after it, so a 400 whose body
+ * happens to quote this text (a reflected request parameter, say) must not pass for it.
+ */
+export const OVERSIZE_PATTERN = /^HTTP request failed: Acronis response is larger than \d+ bytes and was not read$/;
 
 export function isOversizeResult(result: { isError?: boolean; content?: unknown } | undefined): boolean {
-  return Boolean(result?.isError) && OVERSIZE_PATTERN.test(JSON.stringify(result?.content ?? ""));
+  if (!result?.isError || !Array.isArray(result.content)) return false;
+  const first = (result.content as Array<{ type?: string; text?: unknown }>).find((block) => block?.type === "text");
+  return typeof first?.text === "string" && OVERSIZE_PATTERN.test(first.text);
 }
 
 // Parameter names that cut a list down, in the order they are suggested.

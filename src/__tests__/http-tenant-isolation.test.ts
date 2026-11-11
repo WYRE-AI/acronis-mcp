@@ -18,7 +18,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startHttpTransport } from "../index.js";
 import { createStdioSpawner, setDefaultSpawner } from "../upstream-pool.js";
 
@@ -81,7 +81,6 @@ beforeAll(async () => {
   process.env.MCP_HTTP_PORT = "0";
   process.env.MCP_HTTP_HOST = "127.0.0.1";
   process.env.LOG_LEVEL = "error";
-  process.env.ACRONIS_MEMORY_LIMIT_MB = "1024"; // room for the two tenants' children (0.5 Gi allows one)
   setDefaultSpawner(
     createStdioSpawner({
       API_BASE_URL: fakeOrigin,
@@ -96,12 +95,14 @@ afterAll(async () => {
   setDefaultSpawner(undefined);
   delete process.env.CONDUIT_S2S_SECRET;
   delete process.env.AUTH_MODE;
-  delete process.env.ACRONIS_MEMORY_LIMIT_MB;
   rmSync(recordDir, { recursive: true, force: true });
 });
 
 // A fresh server (and so a fresh, empty pool) per test.
 beforeEach(async () => {
+  // A 1 Gi container, as the runtime would report it: room for the two tenants' children (0.5 Gi allows one).
+  // Per test, because the vitest config restores mocks before each one.
+  vi.spyOn(process, "constrainedMemory").mockReturnValue(1024 * 1024 * 1024);
   tokenRequests = [];
   apiCalls = [];
   for (const f of readdirSync(recordDir)) rmSync(join(recordDir, f));

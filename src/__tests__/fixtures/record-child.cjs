@@ -17,6 +17,13 @@ if (dir) {
   );
 }
 
+// With ACRONIS_TEST_IMMORTAL=1 the child ignores SIGTERM and stays alive after stdin
+// closes, so only SIGKILL stops it: the pool's close must escalate that far.
+if (process.env.ACRONIS_TEST_IMMORTAL === "1") {
+  process.on("SIGTERM", () => undefined);
+  setInterval(() => undefined, 1000);
+}
+
 if (process.env.ACRONIS_TEST_HOG === "1") {
   process.on("SIGUSR2", () => {
     const keep = [];

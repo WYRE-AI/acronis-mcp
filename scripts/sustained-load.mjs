@@ -16,7 +16,10 @@
 // (the response cap, so the worst response that still gets through),
 // LOAD_WRAPPER_FLAGS (the wrapper's node flags; default: the ones in the Dockerfile CMD),
 // LOAD_STALL_MS (100: how long the wrapper's event loop is blocked every 250 ms, as
-// a 0.25 vCPU container does under load; 0 turns it off), LOAD_JSON=1 (one JSON line only).
+// a 0.25 vCPU container does under load; 0 turns it off), LOAD_SLICE_MS (the pool's
+// time slice, ACRONIS_POOL_SLICE_MS; default 10 s), LOAD_JSON=1 (one JSON line only).
+// The container size is simulated by making process.constrainedMemory() report it.
+// Callers are spread over the tenants in turn, so 6 callers on 2 tenants is 3 each.
 //
 // RSS is summed per process, so shared pages are counted once per process: the
 // total is an upper bound. Numbers differ between macOS and Linux; re-run it in
@@ -66,6 +69,8 @@ function realisticBody(bytes) {
 
 // ---- worker: the wrapper itself, started as `node <flags> sustained-load.mjs --worker` ----
 if (process.argv[2] === "--worker") {
+  // Pretend to be a container of this size, the way a cgroup limit shows up to Node.
+  process.constrainedMemory = () => Number(process.env.LOAD_MEMORY_MB) * 1024 * 1024;
   const { startHttpTransport } = await import(join(root, "dist", "index.js"));
   const { createStdioSpawner, setDefaultSpawner } = await import(join(root, "dist", "upstream-pool.js"));
   setDefaultSpawner(createStdioSpawner({ API_BASE_URL: process.env.LOAD_FAKE_ORIGIN }));
@@ -105,7 +110,8 @@ const worker = spawn(process.execPath, [...WRAPPER_FLAGS, join(here, "sustained-
     MCP_HTTP_HOST: "127.0.0.1",
     LOG_LEVEL: "error",
     NODE_ENV: "production",
-    ACRONIS_MEMORY_LIMIT_MB: String(MEMORY_MB),
+    LOAD_MEMORY_MB: String(MEMORY_MB),
+    ...(process.env.LOAD_SLICE_MS ? { ACRONIS_POOL_SLICE_MS: process.env.LOAD_SLICE_MS } : {}),
   },
   stdio: ["ignore", "pipe", "inherit"],
 });
@@ -176,13 +182,21 @@ const sampler = setInterval(() => {
 }, 20);
 
 const counts = { ok: 0, rate_limited: 0, error: 0, http_error: 0 };
+// Per tenant: how many calls got an answer, how many were refused, and the longest a call took.
+const perTenant = Array.from({ length: TENANTS }, () => ({ ok: 0, rate_limited: 0, failed: 0, worstMs: 0 }));
 const details = [];
 const end = Date.now() + SECONDS * 1000;
 await Promise.all(
   Array.from({ length: CALLERS }, async (_, i) => {
+    const tenant = i % TENANTS;
     while (Date.now() < end) {
-      const r = await call(i % TENANTS).catch((e) => ({ kind: "http_error", detail: String(e.message) }));
+      const began = Date.now();
+      const r = await call(tenant).catch((e) => ({ kind: "http_error", detail: String(e.message) }));
       counts[r.kind]++;
+      const t = perTenant[tenant];
+      if (r.kind === "ok" || r.kind === "rate_limited") t[r.kind]++;
+      else t.failed++;
+      t.worstMs = Math.max(t.worstMs, Date.now() - began);
       if (r.detail && details.length < 3) details.push(r.detail);
     }
   })
@@ -201,6 +215,7 @@ const result = {
   responseKb: RESPONSE_KB,
   wrapperFlags: WRAPPER_FLAGS,
   calls: counts,
+  perTenant,
   idle: { wrapperMb: r1(idle.wrapper), childrenMb: idleChildren.map(r1) },
   peak: { wrapperMb: r1(peakWrapper), childMb: r1(peakChild), totalMb: r1(peakTotal), liveChildren: peakProcesses },
   childPidsSeen: seenPids.size,
@@ -217,6 +232,7 @@ if (process.env.LOAD_JSON === "1") {
 } else {
   console.log(`container ${MEMORY_MB} MiB, wrapper flags [${WRAPPER_FLAGS.join(" ")}], ${CALLERS} callers on ${TENANTS} tenants, ${RESPONSE_KB} KiB responses, ${SECONDS}s`);
   console.log(`calls: ${counts.ok} ok, ${counts.rate_limited} rate_limited, ${counts.error + counts.http_error} failed`);
+  perTenant.forEach((t, i) => console.log(`  tenant ${i}: ${t.ok} ok, ${t.rate_limited} rate_limited, ${t.failed} failed, longest call ${t.worstMs} ms`));
   console.log(`idle: wrapper ${result.idle.wrapperMb} MiB, children ${result.idle.childrenMb.join(" + ") || "none"} MiB`);
   console.log(`peak: wrapper ${result.peak.wrapperMb}, one child ${result.peak.childMb}, TOTAL ${result.peak.totalMb} MiB (budget ${BUDGET_MB}), most live children ${peakProcesses}, child pids seen ${seenPids.size}`);
   console.log(result.failures.length ? `FAILED: ${result.failures.join("; ")}` : "OK");
