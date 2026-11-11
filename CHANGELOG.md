@@ -52,6 +52,28 @@ under "Still open" are NOT done and must stay open until they are.
   busy for ever: 2 tenants x 3 callers on one child for 45 s gave 607 calls to
   one and 3 to the other (6 `rate_limited`, longest wait 30.1 s); now 267 and
   223, none refused, longest call 11.3 s (macOS, Node 26).
+- An idle child is replaced only once it has been up for a time slice. Before,
+  any idle child was replaced the moment another credential waited, so tenants
+  that paused between calls swapped the child back and forth, each swap a cold
+  start. At 0.5 Gi, 2 tenants x 3 callers, 30 s (macOS, Node 26): spawns per
+  minute 38.4 -> 7.9 back to back, 20.3 -> 7.8 with a 500 ms pause, 26.7 -> 7.4
+  with a 2 s pause, 28.9 -> 7.4 with 10 tenants; 204 -> 1171 calls back to back.
+  The cost: with 10 tenants on one child only about three are served in 30 s and
+  the rest get `rate_limited` (before, the swaps spread 59 calls thinly over all
+  ten and refused 492). More than about three active tenants needs 1 Gi.
+- A child that replaces an idle one has an 8 s spawn timeout, not 30 s: the idle
+  child takes no new calls until the replacement is up, so a slow newcomer no
+  longer holds a healthy tenant for up to 30 s.
+- At most 3 callers of one credential wait in the pool queue (of 8), so one
+  tenant's parallel callers can no longer fill it and have every other tenant
+  refused at once.
+- `ACRONIS_POOL_SLICE_MS` is clamped to 1000-15000 ms (1 would respawn per call;
+  a huge value brings starvation back). The pool logs one `Upstream pool` line at
+  startup with the memory limit it found (or that it is unknown), the derived
+  ceiling, the maximum and the slice.
+- `CHILD_PEAK_MB` is now 145 (Linux CI, Node 24: child 139-141 MiB, wrapper
+  123-128, total 349-350 MiB at 0.5 Gi and 659 MiB at 1 Gi). The ceilings are
+  1 at 0.5 Gi, 2 (was 3) at 0.75 Gi, and 4 at 1 Gi.
 - `response_too_large` is returned only when the first text block of the error
   is exactly the guard's message (`HTTP request failed: Acronis response is
   larger than N bytes and was not read`). An upstream 400 whose body quotes that

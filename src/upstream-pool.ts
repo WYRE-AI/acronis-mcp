@@ -12,16 +12,15 @@ import { tmpdir } from "node:os";
  * Memory is the hard limit (WYREAI-711), and what counts is the PEAK of the
  * wrapper and of each child under SUSTAINED load, not idle sizes or a one-shot
  * call. scripts/sustained-load.mjs measures it with the real wrapper process,
- * real children and the real egress guard (Node 26, macOS; NOT Linux, NOT in the
- * image): wrapper idle ~85 and peak ~137 MiB (it runs --max-old-space-size=64),
- * child idle ~113 and peak ~126 MiB (one call at a time, a response of at most
- * the guard's 256 KiB cap), 2 children + the wrapper ~385 MiB, and a third child
- * starting on top ~485 MiB. Each child also runs with a heap cap so a runaway
- * child dies alone.
+ * real children and the real egress guard (macOS with Node 26, and the Linux CI
+ * job with Node 22 and 24; NOT in the image): wrapper idle ~85 and peak 123-137
+ * MiB (it runs --max-old-space-size=64), child idle ~113 and peak 126 (macOS) to
+ * 141 (Linux, Node 24) MiB (one call at a time, a response of at most the guard's
+ * 256 KiB cap). Each child also runs with a heap cap so a runaway child dies alone.
  *
  * poolCeilingForMemory turns those peaks into a child count with a 15% margin:
- * 1 child at 0.5 Gi (the fleet today, azure/vendor-fleet.bicep `memory`), 4 at
- * 1 Gi. The pool is never above max children plus the one replacement that
+ * 1 child at 0.5 Gi (the fleet today, azure/vendor-fleet.bicep `memory`), 2 at
+ * 0.75 Gi, 4 at 1 Gi. The pool is never above max children plus the one replacement that
  * starts before an idle child is evicted, and that replacement is counted until the
  * evicted child has actually exited. Beyond that a new credential waits in a short,
  * bounded queue and is then refused with PoolBusyError; it never spawns.
@@ -51,11 +50,11 @@ import { logger } from "./utils/logger.js";
 export const CHILD_MAX_OLD_SPACE_MB = 80;
 /** V8 young-generation cap for each child and the wrapper (MiB). The default costs ~20 MiB of RSS per process. */
 export const MAX_SEMI_SPACE_MB = 1;
-/** Peak RSS of a child (MiB): ~126 measured under sustained load, rounded up. */
-export const CHILD_PEAK_MB = 130;
+/** Peak RSS of a child (MiB): 126 on macOS, 139-141 on Linux (Node 24 in CI) under sustained load, rounded up. */
+export const CHILD_PEAK_MB = 145;
 /** RSS of a child that has just started (MiB): ~113 measured. One extra starts before an idle child is evicted. */
 export const CHILD_STARTUP_MB = 115;
-/** Peak RSS of the wrapper under sustained load (MiB): ~137 measured with --max-old-space-size=64, rounded up. */
+/** Peak RSS of the wrapper under sustained load (MiB): 137 on macOS, 123-128 on Linux, with --max-old-space-size=64, rounded up. */
 export const WRAPPER_PEAK_MB = 140;
 /** Headroom kept on top of the measured peaks, as a fraction of the container's memory. */
 export const MEMORY_MARGIN = 0.15;
@@ -67,11 +66,19 @@ export const MAX_POOL_MAX = 4;
 export const MAX_CALLS_PER_CHILD = 1;
 /** A child that has not answered `initialize` (it fetches its token first) by then is killed. */
 export const SPAWN_TIMEOUT_MS = 30_000;
+/**
+ * The same for a child that replaces an idle one. Until it is up the idle child
+ * takes no new calls, so a slow or tarpitted newcomer must not hold a healthy
+ * tenant for the full SPAWN_TIMEOUT_MS.
+ */
+export const REPLACEMENT_SPAWN_TIMEOUT_MS = 8_000;
 export const DEFAULT_POOL_IDLE_MS = 10 * 60 * 1000;
 /** How long a new credential waits for a free pool slot when every child is busy. */
 export const DEFAULT_POOL_WAIT_MS = 30_000;
 /** At most this many callers wait for a slot; the next one is refused at once. */
 export const DEFAULT_POOL_MAX_QUEUE = 8;
+/** Of those, at most this many are for one credential, so a tenant's parallel callers cannot fill the queue. */
+export const MAX_WAITERS_PER_CREDENTIAL = 3;
 /**
  * How long a child serves its tenant before it must make way for a waiting
  * credential. A swap costs a child start (token fetch, ~115 MiB), so the slice is
@@ -79,6 +86,8 @@ export const DEFAULT_POOL_MAX_QUEUE = 8;
  * DEFAULT_POOL_WAIT_MS.
  */
 export const DEFAULT_POOL_SLICE_MS = 10_000;
+/** ACRONIS_POOL_SLICE_MS is clamped to this and to half the wait: a smaller slice is a respawn per call. */
+export const MIN_POOL_SLICE_MS = 1_000;
 /**
  * How long the pool waits for a child to finish closing. The stdio transport already
  * escalates (stdin EOF, 2 s, SIGTERM, 2 s, SIGKILL), so this only bounds a close
@@ -130,6 +139,8 @@ export interface UpstreamConnection {
 export interface SpawnContext {
   /** Call when the child exits on its own so the pool drops the entry. */
   onClose: () => void;
+  /** Overrides the spawner's own timeout for this spawn (a replacement spawn is given a shorter one). */
+  spawnTimeoutMs?: number;
 }
 
 export type Spawner = (
@@ -207,7 +218,7 @@ export function createStdioSpawner(
       if (!closing) ctx.onClose();
     };
     try {
-      await client.connect(transport, { timeout: spawnTimeoutMs });
+      await client.connect(transport, { timeout: ctx.spawnTimeoutMs ?? spawnTimeoutMs });
     } catch (err) {
       closing = true;
       await transport.close().catch(() => undefined);
@@ -324,7 +335,11 @@ export function poolOptionsFromEnv(
   return {
     max: positiveInt(env.ACRONIS_POOL_MAX),
     idleMs: positiveInt(env.ACRONIS_POOL_IDLE_MS) ?? DEFAULT_POOL_IDLE_MS,
-    sliceMs: positiveInt(env.ACRONIS_POOL_SLICE_MS) ?? DEFAULT_POOL_SLICE_MS,
+    // Not below 1 s (every swap would be a cold start) and not above half the wait (a waiter would time out first).
+    sliceMs: Math.min(
+      Math.max(positiveInt(env.ACRONIS_POOL_SLICE_MS) ?? DEFAULT_POOL_SLICE_MS, MIN_POOL_SLICE_MS),
+      DEFAULT_POOL_WAIT_MS / 2
+    ),
     ...(requestedMb && known ? { memoryLimitBytes: Math.min(requestedMb * 1024 * 1024, constrainedMemory) } : {}),
   };
 }
@@ -414,6 +429,13 @@ export class UpstreamPool {
     this.maxQueue = opts.maxQueue ?? DEFAULT_POOL_MAX_QUEUE;
     this.failedSpawnTtlMs = opts.failedSpawnTtlMs ?? FAILED_SPAWN_TTL_MS;
     this.now = opts.now ?? Date.now;
+    const limit = opts.memoryLimitBytes ?? process.constrainedMemory();
+    logger.info("Upstream pool", {
+      memoryLimitMb: limit > 0 && limit < 2 ** 50 ? Math.round(limit / 1024 / 1024) : `unknown (assuming ${FALLBACK_MEMORY_MB})`,
+      ceiling,
+      max: this.max,
+      sliceMs: this.sliceMs,
+    });
   }
 
   get size(): number {
@@ -551,11 +573,17 @@ export class UpstreamPool {
     return [...this.waitingFor.keys()].some((k) => k !== entry.key);
   }
 
-  /** Park until the pool changes, or fail with PoolBusyError if the queue is full or the deadline has passed. */
+  /**
+   * Park until the pool changes (or an idle child has aged enough to be replaced), or
+   * fail with PoolBusyError if the queue is full, this credential already has
+   * MAX_WAITERS_PER_CREDENTIAL callers in it, or the deadline has passed. The
+   * per-credential cap keeps one tenant's parallel callers from filling the queue.
+   */
   private async waitForSlot(key: string, deadline: number, signal?: AbortSignal): Promise<void> {
     const remaining = deadline - this.now();
-    if (remaining <= 0 || this.waiters.length >= this.maxQueue) throw new PoolBusyError();
-    await parkInQueue(this.waiters, remaining, signal, key);
+    const own = this.waitingFor.get(key) ?? 0; // includes this caller
+    if (remaining <= 0 || this.waiters.length >= this.maxQueue || own > MAX_WAITERS_PER_CREDENTIAL) throw new PoolBusyError();
+    await parkInQueue(this.waiters, Math.min(remaining, this.msUntilIdleChildMayBeReplaced() ?? remaining), signal, key);
   }
 
   /** The error of a spawn that failed for this credential within the TTL, if any. */
@@ -577,8 +605,22 @@ export class UpstreamPool {
     }
   }
 
+  /**
+   * The oldest-used idle child that has been up for at least a time slice. A younger
+   * one is not replaced, so a slot is not respawned more often than once per slice
+   * however briefly its tenant pauses; its waiters are woken when it has aged.
+   */
   private leastRecentlyUsedIdle(): Entry | undefined {
-    return [...this.entries.values()].find((e) => e.inUse === 0);
+    return [...this.entries.values()].find((e) => e.inUse === 0 && this.now() - e.startedAt >= this.sliceMs);
+  }
+
+  /** How long until the soonest idle child has been up for a slice (to look again), if there is one that has not. */
+  private msUntilIdleChildMayBeReplaced(): number | undefined {
+    const waits = [...this.entries.values()]
+      .filter((e) => e.inUse === 0)
+      .map((e) => e.startedAt + this.sliceMs - this.now())
+      .filter((ms) => ms > 0);
+    return waits.length ? Math.min(...waits) : undefined;
   }
 
   private wake(): void {
@@ -608,6 +650,7 @@ export class UpstreamPool {
     };
     const spawned = this.spawner(creds, this.toolsInclude, {
       onClose: () => this.drop(entry),
+      ...(victim ? { spawnTimeoutMs: REPLACEMENT_SPAWN_TIMEOUT_MS } : {}),
     });
     entry.conn = victim ? spawned.then((conn) => this.closeVictim(victim, conn)) : spawned;
     entry.conn.catch((error: unknown) => {

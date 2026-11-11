@@ -159,10 +159,15 @@ wrapper and of each child is sampled every 20 ms. `npm run test:load`
 `npm test` because it needs the CPU to itself) runs it as a regression test and fails above the
 container size or on any crashed child (set `ACRONIS_SKIP_LOAD_TEST=1` to skip it).
 
-**All numbers are from macOS with Node 26. They have not been measured on Linux or in the image;
-nobody working on this had Docker.** Before trusting a size, run the image under the real limit
-(`docker run -m 512m ...`) and re-run the script there. The Linux numbers will differ; adjust
-`WRAPPER_PEAK_MB`, `CHILD_PEAK_MB` and `CHILD_STARTUP_MB` in `src/upstream-pool.ts` to what it shows.
+**The table below is macOS with Node 26. The Linux CI job (Ubuntu, not the alpine image and not under
+`docker run -m`) prints the same measurement: on Node 24 the wrapper peaked at 123-128 MiB and a
+child at 139-141 MiB, with a total of 349-350 MiB at 0.5 Gi (budget 512) and 659 MiB at 1 Gi
+(budget 1024); Node 22 is lower (wrapper 98-103, child 123-133, 310-313 and 610 MiB). The constants
+in `src/upstream-pool.ts` follow the largest of these: `CHILD_PEAK_MB` 145, `WRAPPER_PEAK_MB` 140
+(the wrapper is lower on Linux; it was not lowered). Nobody working on this had Docker, so nothing
+here is measured in the image.** Before trusting a size, run the image under the real limit
+(`docker run -m 512m ...`) and re-run the script there; adjust `WRAPPER_PEAK_MB`, `CHILD_PEAK_MB` and
+`CHILD_STARTUP_MB` to what it shows.
 
 | Sustained load, 2 tenants, 6 callers, 6 s | Before | Now |
 |---|---|---|
@@ -171,9 +176,10 @@ nobody working on this had Docker.** Before trusting a size, run the image under
 | Children at 0.5 Gi | 2 | 1 |
 | **Total RSS, peak** | **691-692 MiB** (budget 512; the pool believed about 480) | **330-338 MiB** (budget 512) |
 
-At 1 Gi with 4 tenants and 8 callers the total peaked at 627-628 MiB (wrapper 134-140, a child
-123-125). Two children plus a third starting (what 0.5 Gi would allow at 2) peaked at 483 MiB in the
-same harness: it fits, but leaves no 15% margin, which is why 0.5 Gi gets 1.
+At 1 Gi with 4 tenants and 8 callers the total peaked at 627-628 MiB on macOS (wrapper 134-140, a
+child 123-125) and 659 MiB on Linux with Node 24. Two children plus a third starting (what 0.5 Gi
+would allow at 2) peaked at 483 MiB on macOS: it fits, but leaves no 15% margin, which is why 0.5 Gi
+gets 1.
 
 A child is bounded these ways:
 
@@ -194,7 +200,10 @@ A child is bounded these ways:
   9 calls in flight or waiting: the 10th at the same moment is refused at once with `rate_limited`**,
   and a queued call that waits 30 s (nine slow Acronis calls in a row will) gets it too.
 - **Spawn timeout:** a child that has not answered `initialize` (it fetches its token first) within
-  **30 s** is killed.
+  **30 s** is killed; a child that **replaces** an idle one (the pool is full) within **8 s**, because
+  the idle child takes no new calls until the replacement is up, so a slow or tarpitted newcomer must
+  not hold a healthy tenant for 30 s. A replacement that times out is remembered as a failed spawn
+  (below), so a bad credential cannot repeat it.
 
 The ceiling on children is derived from the container's memory limit (`process.constrainedMemory()`,
 which reads the cgroup limit; 0, unknown or "unlimited" falls back to 512 MiB, i.e. 1 child).
@@ -202,17 +211,20 @@ which reads the cgroup limit; 0, unknown or "unlimited" falls back to 512 MiB, i
 (with a warning) when Node cannot read one, so a wrong value cannot size the pool past the
 container:
 
-    children = clamp(floor((limit / 1.15 - 140 wrapper peak - 115 one child starting) / 130 peak per child), 1, 4)
+    children = clamp(floor((limit / 1.15 - 140 wrapper peak - 115 one child starting) / 145 peak per child), 1, 4)
 
 | Container memory | Children |
 |---|---|
-| 0.5 Gi (the fleet today, `azure/vendor-fleet.bicep`) | **1** |
-| 0.75 Gi | 3 |
-| 1 Gi or more | **4** (hard ceiling) |
+| 0.5 Gi (the fleet today, `azure/vendor-fleet.bicep`) | **1** (190 MiB left for children: 1.3, floored) |
+| 0.75 Gi | 2 (was 3 with the macOS child peak of 130) |
+| 1 Gi or more | **4** (hard ceiling; 4.4 before the clamp) |
 
 The 15% margin is applied to the whole sum, and the "one child starting" is the replacement the pool
 starts before it evicts an idle child (below). `ACRONIS_POOL_MAX` can only lower the ceiling (a higher
-value is clamped and logged).
+value is clamped and logged). At startup the pool logs one line, `Upstream pool`, with the memory
+limit it found (or `unknown (assuming 512)`), the derived ceiling, the effective maximum and the time
+slice, so an operator can see why a 1 Gi container runs one child (Node could not read the limit:
+`constrainedMemory()` is 0, and `ACRONIS_MEMORY_LIMIT_MB` cannot raise it).
 
 **What 1 child at 0.5 Gi means in practice: very few concurrent tenants.** A second tenant that calls
 while the first is mid-call waits for its turn (below), up to 30 s, and is then refused with
@@ -235,8 +247,16 @@ How the pool behaves at the ceiling:
   8 s, so one stuck child cannot hold up every later replacement. Tested with a counting spawner
   (30 distinct newcomers at max 2 with a slow-closing child: peak 3) and under churn.
 - If every child is busy, or a replacement is starting, the caller waits in a queue of at most **8**
-  callers for up to **30 s**, then is refused at once with `{"error":{"code":"rate_limited",...}}`
-  (the 429 case). It never spawns an extra child.
+  callers, **at most 3 of them for one credential** (so one tenant's parallel callers cannot fill the
+  queue and have every other tenant refused at once; a fourth caller of the same tenant is refused
+  at once), for up to **30 s**, then is refused at once with
+  `{"error":{"code":"rate_limited",...}}` (the 429 case). It never spawns an extra child.
+- **Minimum residency.** An idle child is replaced only once it has been up for a time slice (10 s),
+  so a slot is respawned at most about once per slice, however briefly its tenant pauses between
+  calls. Before, any idle child was replaced the moment another credential waited, so tenants that
+  paused for a moment between calls swapped the child back and forth, each swap a cold start (a
+  token fetch and about 115 MiB, slow at 0.25 vCPU). Waiters wait for the child to age, or for
+  another to free up.
 - **Turns.** A child serves its tenant without limit while nobody else waits (the fast path is
   unchanged). Once a different credential is waiting and the child has held its slot for a **time
   slice (10 s, `ACRONIS_POOL_SLICE_MS`)**, it takes no new calls: the calls already in flight or
@@ -248,6 +268,28 @@ How the pool behaves at the ceiling:
   within about one slice plus the calls in flight, which is why the slice is a third of the 30 s a
   caller waits. With more tenants than children the wait is several slices, so more than about
   three tenants per child will see `rate_limited`: that is the capacity limit, and the answer is memory.
+  `ACRONIS_POOL_SLICE_MS` is clamped to between 1 s (a smaller slice is a respawn per call) and 15 s,
+  half the 30 s wait (a longer one means a waiter times out before the child makes way).
+
+  **Measured churn** (0.5 Gi, ceiling 1, real children, 2 tenants x 3 callers, 30 s, macOS, Node 26;
+  `scripts/sustained-load.mjs` does not take a think time, so these runs used a copy of the reviewer's
+  harness with a pause between each caller's calls):
+
+  | Case | Spawns per minute, before -> after | Calls completed, before -> after | `rate_limited`, before -> after |
+  |---|---|---|---|
+  | back to back | 38.4 -> 7.9 | 204 -> 1171 | 0 -> 0 |
+  | 500 ms pause between calls | 20.3 -> 7.8 | 74 -> 175 | 0 -> 0 |
+  | 2 s pause | 26.7 -> 7.4 | 45 -> 48 | 0 -> 0 |
+  | 10 tenants x 2 callers, 500 ms pause | 28.9 -> 7.4 | 59 -> 117 | 492 -> 587 |
+
+  The reviewer measured higher churn before (157 spawns per minute at a 500 ms pause) than this
+  repeat of the same shape did (20); the harness settings may differ. After, every case is at about
+  one spawn per slice (6 per minute plus the start). **The last row is the honest cost:** with 10
+  tenants on one child, three tenants are served in 30 s (one per 10 s slice) and the rest wait out
+  the 30 s and get `rate_limited` (six of ten tenants got no call in 30 s). Before, the idle-child
+  swaps spread the service thinly over all ten (4-8 calls each, 59 in all) and refused 492 calls.
+  Neither is usable; more than about three active tenants needs more memory, so **1 Gi is a
+  prerequisite for that**, not an optimisation.
 - A caller that disconnects (the MCP request's abort signal, tested over real HTTP) leaves every
   queue at once and frees its place.
 - A **failed spawn** (wrong or revoked credentials, no route to the datacenter) is remembered for
@@ -400,7 +442,7 @@ stored lowercase.
 | `ACRONIS_ENABLE_WRITES` | No | `true` exposes the 3 write tools. Default `false`. |
 | `ACRONIS_POOL_MAX` | No | Max concurrent upstream children. Default and ceiling are derived from the container memory (1 at 0.5 Gi, 4 at 1 Gi); this can only lower it. See "Pool sizing". |
 | `ACRONIS_MEMORY_LIMIT_MB` | No | Lowers the memory the pool sizes itself for, in MiB. Capped at the container limit Node reads (`process.constrainedMemory()`), and ignored, with a warning, when Node cannot read one (then the pool assumes 512 MiB). It can never raise the ceiling past the container. |
-| `ACRONIS_POOL_SLICE_MS` | No | How long (ms) a child serves its tenant, while another credential waits for a slot, before it takes no new calls and makes way. Default `10000`. See "Pool sizing". |
+| `ACRONIS_POOL_SLICE_MS` | No | How long (ms) a child serves its tenant, while another credential waits for a slot, before it takes no new calls and makes way, and the least time an idle child stays before another credential may replace it. Default `10000`; clamped to 1000-15000. See "Pool sizing". |
 | `ACRONIS_POOL_IDLE_MS` | No | Idle time before a child is closed. Default `600000` (10 min). |
 | `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
 | `AUTH_MODE` | No | `gateway` (Docker image and Compose default) or `env`. `env` uses `ACRONIS_*` only after S2S auth succeeds. |

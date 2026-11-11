@@ -3,7 +3,10 @@ import {
   MAX_CALLS_PER_CHILD,
   MAX_FAILED_SPAWNS,
   MAX_POOL_MAX,
+  MAX_WAITERS_PER_CREDENTIAL,
   PoolBusyError,
+  REPLACEMENT_SPAWN_TIMEOUT_MS,
+  SPAWN_TIMEOUT_MS,
   UpstreamPool,
   buildChildEnv,
   credentialKey,
@@ -18,6 +21,7 @@ import {
   type UpstreamConnection,
 } from "../upstream-pool.js";
 import type { AcronisCredentials } from "../credentials.js";
+import { logger } from "../utils/logger.js";
 
 const A: AcronisCredentials = { baseUrl: "https://us5-cloud.acronis.com", clientId: "a", clientSecret: "sa-secret" };
 const B: AcronisCredentials = { baseUrl: "https://us5-cloud.acronis.com", clientId: "b", clientSecret: "sb-secret" };
@@ -71,7 +75,7 @@ describe("credentialKey", () => {
 describe("UpstreamPool", () => {
   it("spawns one child per distinct tuple and reuses it", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: ["fetch_tenant"], spawner, memoryLimitBytes: 2 ** 30 });
+    const pool = new UpstreamPool({ toolsInclude: ["fetch_tenant"], spawner, sliceMs: 0, memoryLimitBytes: 2 ** 30 });
     await use(pool, A);
     await use(pool, A);
     await use(pool, B);
@@ -84,7 +88,7 @@ describe("UpstreamPool", () => {
 
   it("dedupes concurrent first calls for the same tuple", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
     await Promise.all([use(pool, A), use(pool, A), use(pool, A)]);
     expect(spawned).toHaveLength(1);
     await pool.close();
@@ -92,7 +96,7 @@ describe("UpstreamPool", () => {
 
   it("routes each tenant's call to its own child", async () => {
     const { spawner } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
     const ra = await pool.withConnection(A, (c) => c.callTool("t", {}));
     const rb = await pool.withConnection(B, (c) => c.callTool("t", {}));
     expect(JSON.stringify(ra)).toContain("t:a");
@@ -102,7 +106,7 @@ describe("UpstreamPool", () => {
 
   it("evicts the least-recently-used entry beyond max and closes it", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 2, memoryLimitBytes: 2 ** 30 });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 2, memoryLimitBytes: 2 ** 30 });
     await use(pool, A);
     await use(pool, B);
     await use(pool, A); // A is now most recent; B is LRU
@@ -120,7 +124,7 @@ describe("UpstreamPool", () => {
   it("evicts idle entries after idleMs", async () => {
     let now = 1_000;
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner, idleMs: 600_000, now: () => now });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, idleMs: 600_000, now: () => now });
     await use(pool, A);
     now += 599_000;
     expect(pool.evictIdle()).toBe(0);
@@ -136,7 +140,7 @@ describe("UpstreamPool", () => {
 
   it("never evicts a busy child: a new credential waits for a free slot", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1 });
     let release!: () => void;
     const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
     await new Promise((r) => setTimeout(r, 0));
@@ -155,7 +159,7 @@ describe("UpstreamPool", () => {
 
   it("reuses the busy child for the same credential instead of spawning a second one (A, B, A with max 1)", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 50, max: 1 }); // A is younger than a slice when it is released
     let release!: () => void;
     const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
     await new Promise((r) => setTimeout(r, 0));
@@ -174,7 +178,7 @@ describe("UpstreamPool", () => {
 
   it("fails with PoolBusyError when no slot frees up within waitMs", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, waitMs: 20 });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, waitMs: 20 });
     let release!: () => void;
     const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
     await new Promise((r) => setTimeout(r, 0));
@@ -187,7 +191,7 @@ describe("UpstreamPool", () => {
 
   it("close() also closes a retired child that is still serving a call", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
     let release!: () => void;
     const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
     await new Promise((r) => setTimeout(r, 0));
@@ -201,7 +205,7 @@ describe("UpstreamPool", () => {
 
   it("drops an entry when the child exits and respawns on next use", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
     await use(pool, A);
     spawned[0].onClose();
     expect(pool.size).toBe(0);
@@ -219,7 +223,7 @@ describe("UpstreamPool", () => {
         attempts++;
         throw new Error("invalid_client");
       };
-      const pool = new UpstreamPool({ toolsInclude: [], spawner });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
       for (let i = 0; i < 20; i++) await expect(use(pool, A)).rejects.toThrow("invalid_client");
       expect(attempts).toBe(1);
       expect(pool.size).toBe(0);
@@ -231,7 +235,7 @@ describe("UpstreamPool", () => {
         if (creds.clientId === "a") throw new Error("invalid_client");
         return okConn();
       };
-      const pool = new UpstreamPool({ toolsInclude: [], spawner });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
       await expect(use(pool, A)).rejects.toThrow("invalid_client");
       await expect(use(pool, B)).resolves.toBeUndefined();
       await pool.close();
@@ -244,7 +248,7 @@ describe("UpstreamPool", () => {
         if (attempts++ === 0) throw new Error("boom");
         return okConn();
       };
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, failedSpawnTtlMs: 30_000, now: () => now });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, failedSpawnTtlMs: 30_000, now: () => now });
       await expect(use(pool, A)).rejects.toThrow("boom");
       now += 29_000;
       await expect(use(pool, A)).rejects.toThrow("boom"); // still cached
@@ -259,7 +263,7 @@ describe("UpstreamPool", () => {
       const spawner: Spawner = async () => {
         throw new Error("nope");
       };
-      const pool = new UpstreamPool({ toolsInclude: [], spawner });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
       for (let i = 0; i < MAX_FAILED_SPAWNS + 50; i++) {
         await use(pool, { ...A, clientSecret: `secret-${i}` }).catch(() => undefined);
       }
@@ -273,9 +277,9 @@ describe("UpstreamPool", () => {
   describe("pool cap", () => {
     const MiB = 1024 * 1024;
 
-    it("derives the ceiling from the container's memory: 1 child at 0.5 Gi, 4 at 1 Gi, never above MAX_POOL_MAX, never below 1", () => {
+    it("derives the ceiling from the container's memory: 1 child at 0.5 Gi, 2 at 0.75 Gi, 4 at 1 Gi, never above MAX_POOL_MAX, never below 1", () => {
       expect(poolCeilingForMemory(512 * MiB)).toBe(1);
-      expect(poolCeilingForMemory(768 * MiB)).toBe(3);
+      expect(poolCeilingForMemory(768 * MiB)).toBe(2);
       expect(poolCeilingForMemory(1024 * MiB)).toBe(4);
       expect(poolCeilingForMemory(64 * 1024 * MiB)).toBe(MAX_POOL_MAX);
       expect(poolCeilingForMemory(200 * MiB)).toBe(1);
@@ -299,7 +303,7 @@ describe("UpstreamPool", () => {
     it("uses that ceiling as the default size, and ACRONIS_POOL_MAX can only lower it", async () => {
       expect(poolOptionsFromEnv({}).max).toBeUndefined();
       const { spawner, spawned } = fakeSpawner();
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, memoryLimitBytes: 512 * MiB, waitMs: 5 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, memoryLimitBytes: 512 * MiB, waitMs: 5 });
       const held = pool.withConnection(A, () => new Promise<void>(() => undefined));
       await new Promise((r) => setTimeout(r, 10));
       expect(spawned).toHaveLength(1);
@@ -311,7 +315,7 @@ describe("UpstreamPool", () => {
 
     it("clamps max to the ceiling and never spawns beyond it", async () => {
       const { spawner, spawned } = fakeSpawner();
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1_000, memoryLimitBytes: 64 * 1024 * MiB, waitMs: 5 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1_000, memoryLimitBytes: 64 * 1024 * MiB, waitMs: 5 });
       const releases: Array<() => void> = [];
       const held: Array<Promise<void>> = [];
       for (let i = 0; i < MAX_POOL_MAX; i++) {
@@ -328,7 +332,7 @@ describe("UpstreamPool", () => {
 
     it("refuses at once when the wait queue is full, without waiting out waitMs", async () => {
       const { spawner, spawned } = fakeSpawner();
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, maxQueue: 2, waitMs: 60_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, maxQueue: 2, waitMs: 60_000 });
       let release!: () => void;
       const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
       await new Promise((r) => setTimeout(r, 0));
@@ -350,7 +354,7 @@ describe("UpstreamPool", () => {
 
     it(`runs at most ${MAX_CALLS_PER_CHILD} calls at once in one child; the rest wait for a slot`, async () => {
       const { spawner, spawned } = fakeSpawner();
-      const pool = new UpstreamPool({ toolsInclude: [], spawner });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
       let running = 0;
       let peak = 0;
       const gates: Array<() => void> = [];
@@ -376,7 +380,7 @@ describe("UpstreamPool", () => {
 
     it("refuses at once when a child's call queue is full, and a caller that disconnects frees its place", async () => {
       const { spawner } = fakeSpawner();
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, maxQueue: 1, waitMs: 60_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, maxQueue: 1, waitMs: 60_000 });
       const releases: Array<() => void> = [];
       const holds = Array.from({ length: MAX_CALLS_PER_CHILD }, () =>
         pool.withConnection(A, () => new Promise<void>((r) => releases.push(r)))
@@ -401,7 +405,7 @@ describe("UpstreamPool", () => {
 
     it("releases a waiting caller's queue place when that caller disconnects", async () => {
       const { spawner, spawned } = fakeSpawner();
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, maxQueue: 1, waitMs: 60_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, maxQueue: 1, waitMs: 60_000 });
       let release!: () => void;
       const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
       await tick(0);
@@ -426,7 +430,7 @@ describe("UpstreamPool", () => {
         if (creds.clientId.startsWith("bad")) throw new Error("invalid_client");
         return { callTool: async () => ({}), listToolNames: async () => [], close: async () => void closed.push(creds.clientId) };
       };
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1 });
       await use(pool, A); // a healthy tenant, now idle in a full pool
       for (let i = 0; i < 5; i++) await use(pool, { ...B, clientId: `bad${i}` }).catch(() => undefined);
       await tick();
@@ -449,7 +453,7 @@ describe("UpstreamPool", () => {
         if (creds.clientId === "b") await gate;
         return { callTool: async () => ({}), listToolNames: async () => [], close: async () => void closed.push(creds.clientId) };
       };
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1 });
       await use(pool, A);
       const b = use(pool, B);
       await tick();
@@ -493,7 +497,7 @@ describe("UpstreamPool", () => {
 
     it("the child being replaced takes no new calls: its tenant waits behind the newcomer, so the newcomer is served, never refused", async () => {
       const { spawner, stats, release } = countingSpawner("b");
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, waitMs: 60_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, waitMs: 60_000 });
       await use(pool, A);
       const b = use(pool, B); // replaces A; B's spawn is held open
       await tick();
@@ -521,7 +525,7 @@ describe("UpstreamPool", () => {
         if (creds.clientId === "b") await gate;
         return { callTool: async () => ({}), listToolNames: async () => [], close: async () => void closed.push(creds.clientId) };
       };
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1 });
       await use(pool, A);
       const b = use(pool, B);
       await tick();
@@ -537,7 +541,7 @@ describe("UpstreamPool", () => {
     it("never has more live children than max plus the one replacement, however the tenants churn", async () => {
       const { spawner, stats } = countingSpawner("never");
       const max = 2;
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max, memoryLimitBytes: 2 ** 30, waitMs: 2_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max, memoryLimitBytes: 2 ** 30, waitMs: 2_000 });
       const tenants = Array.from({ length: 6 }, (_, i) => ({ ...A, clientId: `t${i}` }));
       await Promise.all(
         Array.from({ length: 8 }, async (_, caller) => {
@@ -582,7 +586,7 @@ describe("UpstreamPool", () => {
     it("a burst of 30 distinct newcomers at max 2 never has more than max + 1 live children (40 ms close, 30 ms spawn)", async () => {
       const { spawner, stats } = slowSpawner(30, 40);
       const max = 2;
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max, memoryLimitBytes: 2 ** 30, waitMs: 60_000, maxQueue: 64 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max, memoryLimitBytes: 2 ** 30, waitMs: 60_000, maxQueue: 64 });
       const tenants = Array.from({ length: 30 }, (_, i) => ({ ...A, clientId: `burst${i}` }));
       await Promise.all(tenants.map((t) => pool.withConnection(t, () => tick(1))));
       expect(stats.spawned).toBe(30);
@@ -593,7 +597,7 @@ describe("UpstreamPool", () => {
 
     it("does not start the next replacement until the evicted child has exited", async () => {
       const { spawner, stats } = slowSpawner(5, 200);
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, waitMs: 60_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, waitMs: 60_000 });
       await use(pool, A);
       const b = use(pool, B); // replaces A: A takes 200 ms to exit
       await tick(50);
@@ -608,7 +612,7 @@ describe("UpstreamPool", () => {
 
     it("stops waiting for a close that never returns, so one stuck child cannot block every later replacement", async () => {
       const { spawner, stats } = slowSpawner(5, 0, true);
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, closeTimeoutMs: 50, waitMs: 60_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, closeTimeoutMs: 50, waitMs: 60_000 });
       await use(pool, A);
       const started = Date.now();
       await use(pool, B); // A's close never returns
@@ -673,7 +677,7 @@ describe("UpstreamPool", () => {
       await vi.advanceTimersByTimeAsync(1_000);
       const bFrom = Date.now();
       const b = hammer(pool, B, 3, end);
-      await vi.advanceTimersByTimeAsync(44_000 + 2_000); // past the end, so the last calls finish
+      await vi.advanceTimersByTimeAsync(44_000 + 2_000 + SLICE); // past the end by a slice, so callers still waiting for a turn are served too
       // B is served within about one time slice plus one call of A having the slot, not never.
       expect(b.firstOkAt).toBeDefined();
       expect(b.firstOkAt! - bFrom).toBeLessThanOrEqual(SLICE + 3 * CALL_MS + CALL_MS);
@@ -724,7 +728,7 @@ describe("UpstreamPool", () => {
     it("hands the slot to the waiters in the order they arrived", async () => {
       const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms));
       const { spawner, started } = recordingSpawner();
-      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: 1_000_000, waitMs: 60_000 });
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: 100, waitMs: 60_000 }); // short, so each child has aged by its turn
       let release!: () => void;
       const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
       await tick(0);
@@ -762,9 +766,94 @@ describe("UpstreamPool", () => {
     });
   });
 
+  describe("churn, replacement spawns and queue limits", () => {
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const ids = (spawned: Array<{ creds: AcronisCredentials }>) => spawned.map((s) => s.creds.clientId);
+
+    it("an idle child is not replaced until it has been up for a time slice", async () => {
+      vi.useFakeTimers();
+      const { spawner, spawned } = fakeSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: 10_000, waitMs: 60_000 });
+      await use(pool, A); // A is idle at once
+      let bDone = false;
+      void use(pool, B).then(() => (bDone = true));
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(ids(spawned)).toEqual(["a"]); // B waits; the idle A is too young to replace
+      expect(bDone).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_500); // A has now been up for a slice, with nothing else waking B
+      expect(ids(spawned)).toEqual(["a", "b"]);
+      expect(bDone).toBe(true);
+      expect(spawned[0].closed).toBe(true);
+      await pool.close();
+    });
+
+    it("two tenants that pause between calls respawn a slot at most once per slice (500 ms think time, ceiling 1, 60 s)", async () => {
+      vi.useFakeTimers();
+      const { spawner, spawned } = fakeSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, max: 1, sliceMs: 10_000, waitMs: 30_000 });
+      const end = Date.now() + 60_000;
+      for (const tenant of [A, B]) {
+        for (let i = 0; i < 3; i++) {
+          void (async () => {
+            while (Date.now() < end) {
+              await pool.withConnection(tenant, () => sleep(100)).catch((e: unknown) => {
+                if (!(e instanceof PoolBusyError)) throw e;
+              });
+              await sleep(500);
+            }
+          })();
+        }
+      }
+      await vi.advanceTimersByTimeAsync(62_000);
+      expect(spawned.length).toBeGreaterThanOrEqual(4); // both tenants are served, in turns
+      expect(spawned.length).toBeLessThanOrEqual(60_000 / 10_000 + 2); // before: a spawn whenever the child was idle between two calls
+      await pool.close();
+    });
+
+    it("a replacement spawn is given the short timeout; a spawn into free room keeps the spawner's own", async () => {
+      const seen: Array<number | undefined> = [];
+      const spawner: Spawner = async (_creds, _include, ctx) => {
+        seen.push(ctx.spawnTimeoutMs);
+        return { callTool: async () => ({}), listToolNames: async () => [], close: async () => undefined };
+      };
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1 });
+      await use(pool, A);
+      await use(pool, B); // replaces A
+      expect(seen).toEqual([undefined, REPLACEMENT_SPAWN_TIMEOUT_MS]);
+      expect(REPLACEMENT_SPAWN_TIMEOUT_MS).toBeLessThan(SPAWN_TIMEOUT_MS);
+      await pool.close();
+    });
+
+    it("one tenant's parallel callers cannot fill the wait queue: its extra callers are refused at once and another tenant still queues", async () => {
+      const { spawner } = fakeSpawner();
+      const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0, max: 1, waitMs: 60_000 });
+      let release!: () => void;
+      const held = pool.withConnection(A, () => new Promise<void>((r) => (release = r)));
+      await sleep(5);
+      const queued = Array.from({ length: MAX_WAITERS_PER_CREDENTIAL }, () => use(pool, B)); // B fills its own share
+      await sleep(5);
+      await expect(use(pool, B)).rejects.toBeInstanceOf(PoolBusyError); // one more is refused at once
+      const c = use(pool, C); // another tenant is not refused
+      await sleep(5);
+      release();
+      await held;
+      await Promise.all([...queued, c]);
+      await pool.close();
+    });
+
+    it("logs the memory limit, the ceiling and the slice once at construction, and says when the limit is unknown", () => {
+      const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+      new UpstreamPool({ toolsInclude: [], memoryLimitBytes: 1024 * 1024 * 1024, sliceMs: 5_000 });
+      expect(info).toHaveBeenCalledWith("Upstream pool", { memoryLimitMb: 1024, ceiling: 4, max: 4, sliceMs: 5_000 });
+      vi.spyOn(process, "constrainedMemory").mockReturnValue(0);
+      new UpstreamPool({ toolsInclude: [] });
+      expect(info).toHaveBeenLastCalledWith("Upstream pool", { memoryLimitMb: "unknown (assuming 512)", ceiling: 1, max: 1, sliceMs: 10_000 });
+    });
+  });
+
   it("close() closes every child and refuses further use", async () => {
     const { spawner, spawned } = fakeSpawner();
-    const pool = new UpstreamPool({ toolsInclude: [], spawner });
+    const pool = new UpstreamPool({ toolsInclude: [], spawner, sliceMs: 0 });
     await use(pool, A);
     await use(pool, B);
     await pool.close();
@@ -789,6 +878,14 @@ describe("poolOptionsFromEnv", () => {
       idleMs: 600_000,
       sliceMs: 10_000,
     });
+  });
+
+  it("clamps the time slice to between 1 s and half the wait: 1 would be a respawn per call, a huge value brings starvation back", () => {
+    expect(poolOptionsFromEnv({ ACRONIS_POOL_SLICE_MS: "1" }, 0).sliceMs).toBe(1_000);
+    expect(poolOptionsFromEnv({ ACRONIS_POOL_SLICE_MS: "999" }, 0).sliceMs).toBe(1_000);
+    expect(poolOptionsFromEnv({ ACRONIS_POOL_SLICE_MS: "99999999999" }, 0).sliceMs).toBe(15_000);
+    expect(poolOptionsFromEnv({ ACRONIS_POOL_SLICE_MS: "5000" }, 0).sliceMs).toBe(5_000);
+    for (const bad of ["0", "-1", "NaN", "abc", ""]) expect(poolOptionsFromEnv({ ACRONIS_POOL_SLICE_MS: bad }, 0).sliceMs).toBe(10_000);
   });
 
   describe("ACRONIS_MEMORY_LIMIT_MB can only lower the memory the pool sizes itself for", () => {
