@@ -12,10 +12,19 @@ version: 2
 # @acronis-platform/mcp) come from public npm.
 #
 # PINNING POLICY (WYREAI-711): @acronis-platform/mcp is pinned to an EXACT
-# version and bundle sha256 (scripts/upstream-pin.json). It has no source repo
-# and no provenance, so Dependabot is told to ignore it entirely: no bump PR
-# exists for a bot (or the dependabot-janitor) to auto-merge. A bump is a manual
-# PR with a human diff of the new bundle (see README "Upstream pinning").
+# version and the sha256 of every file it runs (scripts/upstream-pin.json). It
+# has no source repo and no provenance, so Dependabot is told to ignore it
+# entirely: no bump PR exists for it. A bump is a manual PR with a human diff of
+# the new bundle (see README "Upstream pinning").
+#
+# That is all this file does. It does NOT stop other automation from merging:
+# the org-level dependabot-janitor (not in this repo) auto-merges green grouped
+# PRs, and the github-actions and docker groups below change /.github and
+# /Dockerfile, which hold the pin check, the egress guard copy and the image
+# hardening (both are CODEOWNERS paths). Until the maintainer actions in README
+# "Required maintainer actions" are done (Code Owners review required, required
+# status checks, the janitor excluded from /.github and /Dockerfile), a bot can
+# change those files without a human looking at them.
 
 updates:
   - package-ecosystem: "npm"

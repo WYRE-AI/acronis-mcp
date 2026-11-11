@@ -2,6 +2,8 @@
   "package": "@acronis-platform/mcp",
   "version": "1.0.1",
   "tarballIntegrity": "sha512-fD5hdeNndo6ie3QkGoc5x8UXt1g+uiR1jXIAgNY3yRvgvwYa/YTfkukcFT+Vxl2zwSpNRtEFDrB45va2Nmd22A==",
-  "bundle": "dist/bundle.js",
-  "bundleSha256": "dbdad846d10d00c8a7d2ba1bca395825ea2a40cc9e6eaadfcbe469f3000d1740"
+  "files": {
+    "bin/cli.js": "57f4849aa685901a4cf3e079b1b85aa6efb0c04473d05f81bb508c1ba4fce75c",
+    "dist/bundle.js": "dbdad846d10d00c8a7d2ba1bca395825ea2a40cc9e6eaadfcbe469f3000d1740"
+  }
 }

@@ -6,8 +6,9 @@
 import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { resolveUpstreamBin } from "../upstream-pool.js";
 
 const repo = new URL("../../", import.meta.url).pathname;
 const script = join(repo, "scripts/verify-upstream.mjs");
@@ -15,6 +16,7 @@ const pin = JSON.parse(readFileSync(join(repo, "scripts/upstream-pin.json"), "ut
   package: string;
   version: string;
   tarballIntegrity: string;
+  files: Record<string, string>;
 };
 const readJson = (path: string) => JSON.parse(readFileSync(path, "utf8"));
 
@@ -31,10 +33,11 @@ function fixtureRoot(): string {
   scratch.push(dir);
   const pkgDir = join(dir, "node_modules", pin.package);
   mkdirSync(join(pkgDir, "dist"), { recursive: true });
+  mkdirSync(join(pkgDir, "bin"), { recursive: true });
   cpSync(join(repo, "package.json"), join(dir, "package.json"));
   cpSync(join(repo, "package-lock.json"), join(dir, "package-lock.json"));
   cpSync(join(repo, "node_modules", pin.package, "package.json"), join(pkgDir, "package.json"));
-  cpSync(join(repo, "node_modules", pin.package, "dist/bundle.js"), join(pkgDir, "dist/bundle.js"));
+  for (const file of Object.keys(pin.files)) cpSync(join(repo, "node_modules", pin.package, file), join(pkgDir, file));
   return dir;
 }
 
@@ -51,7 +54,24 @@ describe("upstream bump needs a human", () => {
 
   it("requires a code owner for everything that selects or changes the upstream bundle", () => {
     const owners = readFileSync(join(repo, ".github/CODEOWNERS"), "utf8");
-    for (const path of ["/package.json", "/package-lock.json", "/scripts/upstream-pin.json", "/Dockerfile", "/child-egress-guard.cjs"]) {
+    const paths = [
+      "/package.json",
+      "/package-lock.json",
+      "/scripts/upstream-pin.json",
+      "/scripts/verify-upstream.mjs",
+      "/child-egress-guard.cjs",
+      "/Dockerfile",
+      "/.dockerignore",
+      "/.releaserc.json",
+      "/src/upstream-pool.ts",
+      "/src/credentials.ts",
+      "/src/mcp-server.ts",
+      "/src/s2s-verify.ts",
+      "/src/sanitize.ts",
+      "/src/__tests__/upstream-pin.test.ts",
+      "/.github/",
+    ];
+    for (const path of paths) {
       expect(owners).toMatch(new RegExp(`^${path.replace(/[.]/g, "\\.")}\\s+@\\S+`, "m"));
     }
   });
@@ -71,6 +91,37 @@ describe("upstream pin check", () => {
     const r = run(root);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("sha256 of @acronis-platform/mcp/dist/bundle.js");
+  });
+
+  it("fails when bin/cli.js, the file the pool actually runs, is rewritten (the bundle is untouched)", () => {
+    const root = fixtureRoot();
+    writeFileSync(join(root, "node_modules", pin.package, "bin/cli.js"), "#!/usr/bin/env node\nrequire('../dist/bundle.js');\nrequire('child_process');\n");
+    const r = run(root);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("sha256 of @acronis-platform/mcp/bin/cli.js");
+    expect(r.stderr).not.toContain("dist/bundle.js"); // only the file that changed is reported
+  });
+
+  it("fails when a file is added next to the pinned ones", () => {
+    const root = fixtureRoot();
+    writeFileSync(join(root, "node_modules", pin.package, "dist/extra.js"), "module.exports = 1;\n");
+    const r = run(root);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("unpinned file in the package: dist/extra.js");
+  });
+
+  it("fails when a pinned file is missing", () => {
+    const root = fixtureRoot();
+    rmSync(join(root, "node_modules", pin.package, "bin/cli.js"));
+    const r = run(root);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("sha256 of @acronis-platform/mcp/bin/cli.js: expected");
+    expect(r.stderr).toContain("found missing");
+  });
+
+  it("pins the file the pool executes, not just the bundle behind it", () => {
+    const executed = relative(join(repo, "node_modules", pin.package), resolveUpstreamBin());
+    expect(Object.keys(pin.files)).toContain(executed);
   });
 
   it("fails when the lockfile resolves a different tarball", () => {

@@ -18,15 +18,17 @@ RUN npm ci --ignore-scripts
 
 COPY . .
 
-# Supply chain (WYREAI-711): fail the build unless the installed upstream bundle
-# is byte for byte the pinned one (version, lockfile integrity, bundle sha256).
-RUN node scripts/verify-upstream.mjs
-
 RUN npm run build
 
 # Prune dev dependencies in the builder so the production stage copies a
 # runtime-only node_modules (no re-install, no registry auth needed).
 RUN npm prune --omit=dev && npm cache clean --force
+
+# Supply chain (WYREAI-711): fail the build unless the upstream package that
+# ships (the node_modules copied below, so checked AFTER the prune) is byte for
+# byte the pinned one: version, lockfile integrity, and the sha256 of every file
+# it can run, including bin/cli.js, which is what the pool executes.
+RUN node scripts/verify-upstream.mjs
 
 # Production stage
 FROM node:26-alpine AS production
@@ -47,8 +49,15 @@ COPY --from=builder /app/node_modules ./node_modules
 
 # Remove the npm CLI from the production image — the runtime only needs `node`,
 # and npm's bundled dependencies regularly trip vulnerability scanners.
-RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx && \
-    chown -R acronis:acronis /app
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
+# /app stays owned by root and is not writable by the app user (WYREAI-711).
+# The upstream children run as the same uid as the wrapper, so a hostile bundle
+# could otherwise rewrite the pinned bundle, the egress guard or the wrapper
+# itself for the next spawn. Nothing under /app is written at runtime: each
+# child gets a throwaway HOME under the temp directory. This does not stop a
+# child reading its siblings' /proc/<pid>/environ (README "Supply chain").
+RUN chmod -R a-w,a+rX /app && chown -R root:root /app
 
 USER acronis
 
