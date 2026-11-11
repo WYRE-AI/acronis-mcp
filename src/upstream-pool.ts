@@ -229,8 +229,13 @@ export function createStdioSpawner(
     // child its own private, throwaway HOME so tenants never share a cache
     // directory; it is removed when the child closes.
     const childHome = await mkdtemp(join(tmpdir(), "acronis-tenant-"));
-    await chmod(childHome, 0o700);
     const removeHome = () => rm(childHome, { recursive: true, force: true }).catch(() => undefined);
+    try {
+      await chmod(childHome, 0o700);
+    } catch (err) {
+      await removeHome();
+      throw err;
+    }
     const transport = new ChildTransport({
       command: process.execPath,
       args: ["--require", EGRESS_GUARD, `--max-old-space-size=${CHILD_MAX_OLD_SPACE_MB}`, `--max-semi-space-size=${MAX_SEMI_SPACE_MB}`, resolveUpstreamBin()],
