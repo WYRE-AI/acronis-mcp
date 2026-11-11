@@ -15,14 +15,52 @@ starting any child process. Only `tools/call` starts an upstream child.
 
 ## Upstream pinning policy
 
-`@acronis-platform/mcp` is pinned to an **exact** version in `package.json` (no `^`/`~`; a test
-enforces `1.0.1`). Bumps happen **by pull request only**. Renovate/Dependabot may propose one, but it
-must not auto-merge: a bump needs a human to
+`@acronis-platform/mcp` has no source repository and no provenance, and it ships as one esbuild
+bundle that dependency scanners cannot see into. So it is pinned byte for byte
+(`scripts/upstream-pin.json`):
 
-1. diff the upstream `tools/list` against `research/upstream-tools-1.0.1.json` (new, renamed or
+- the **exact** version in `package.json` (no `^`/`~`),
+- the tarball **integrity** (sha512) in `package-lock.json`, which `npm ci` enforces, and
+- the **sha256 of `dist/bundle.js`**.
+
+`npm run verify-upstream` (`scripts/verify-upstream.mjs`) checks all of it. It runs in both CI jobs
+and in the Dockerfile, where a mismatch **fails the image build**.
+
+Bumps happen **by pull request only, and a human reviews them**. Dependabot is told to ignore the
+package (`.github/dependabot.yml`), and nothing in this repo auto-merges. `.github/CODEOWNERS` names
+the owners of the pin, lockfile, Dockerfile, egress guard and CI. (GitHub enforces CODEOWNERS only if
+the branch protection rule on `main` has "Require review from Code Owners" turned on; that is a
+repository setting.) A bump needs a human to
+
+1. diff the new bundle against the old one (beautify both and compare, or at least the outbound
+   `fetch`/`http` call sites, the token flow and anything touching `process.env` or the filesystem),
+2. diff the upstream `tools/list` against `research/upstream-tools-1.0.1.json` (new, renamed or
    duplicated tools),
-2. regenerate `src/generated/tools.ts` with `npm run gen-tools`,
-3. re-review `research/tiers.json` and the integration test.
+3. regenerate `src/generated/tools.ts` with `npm run gen-tools`,
+4. re-review `research/tiers.json` and the integration test,
+5. update `scripts/upstream-pin.json` (version, `tarballIntegrity` from `npm view <pkg>@<version>
+   dist.integrity`, and `bundleSha256` from `shasum -a 256`).
+
+### Egress (what the code does and what it cannot)
+
+The code confines what it can:
+
+- The base URL is validated to exactly one label under `acronis.com` (see Credentials).
+- Every child preloads `child-egress-guard.cjs`: its `fetch` may reach only the origin of its own
+  `API_BASE_URL`, and it never follows a redirect, so a 307/308 from the token endpoint cannot replay
+  the `client_secret` to another host. This covers `fetch` only; the bundle could still open raw
+  sockets.
+
+**Restricting the container's outbound traffic to `*.acronis.com` cannot be done from inside the
+container or from this repo.** Azure Container Apps gives the container unrestricted egress by
+default. It needs an infrastructure change in the Conduit fleet (`azure/vendor-fleet.bicep` and its
+environment): a VNet-integrated environment whose outbound traffic goes through a user-defined route
+to an FQDN-filtering firewall (for example Azure Firewall) with an application rule that allows only
+`*.acronis.com` on 443. This has not been done and was not verified.
+
+Also not solved here: all children run as the same uid, so a hostile bundle could read the other
+children's `/proc/<pid>/environ`. Per-child uids or a hardened `/proc` need container or platform
+changes. The pin, the egress guard and the review above are what reduce that risk today.
 
 Upstream 1.0.1 ships three duplicated tool names (`device_authorization_approval`,
 `fetch_registration_tokens`, `create_registration_token`); none are allowlisted, and the generator
@@ -43,8 +81,30 @@ So `src/upstream-pool.ts` spawns **one child per distinct credential tuple**
   `OAUTH_CLIENT_SECRET`, `MCP_TRANSPORT=stdio`, `MCP_TOOLS_INCLUDE=<allowlist for enabled tiers>`.
   (The MCP client SDK additionally adds its own non-secret defaults: `HOME`, `LOGNAME`, `SHELL`,
   `TERM`, `USER`.)
-- LRU limit `ACRONIS_POOL_MAX` (default 50), idle TTL `ACRONIS_POOL_IDLE_MS` (default 10 min), and
-  every child is closed on shutdown. An evicted child that is mid-call is closed when the call ends.
+- Every child also preloads `child-egress-guard.cjs` (see "Egress").
+- Idle TTL `ACRONIS_POOL_IDLE_MS` (default 10 min), and every child is closed on shutdown. An
+  evicted child that is mid-call is closed when the call ends.
+
+### Pool sizing and failure modes
+
+Memory is the limit. Each child is a full Node process that loads the 5 MB upstream bundle: about
+**116 MiB RSS** each (measured with the real child, 5 tenants, Node 26 on macOS; not measured on
+Linux or in the container). The fleet gives this container **0.5 Gi**
+(`azure/vendor-fleet.bicep`), and the wrapper itself needs about 50-70 MiB, so:
+
+- `ACRONIS_POOL_MAX` defaults to **3** (3 x 116 MiB + the wrapper is about 400 MiB of 512 MiB).
+  It is clamped to a hard ceiling of **8**. Raise it only together with the container memory
+  (about 130 MiB per child plus 100 MiB for the wrapper) and watch the container's memory metric.
+- Idle children are evicted LRU to make room. A busy child is never evicted.
+- A new credential that finds the pool full of busy children waits in a queue of at most **8**
+  callers for up to **30 s**. Beyond that, or on timeout, the call is refused at once with
+  `{"error":{"code":"rate_limited",...}}` (the 429 case). It never spawns a child.
+- A **failed spawn** (wrong or revoked credentials, no route to the datacenter) is remembered for
+  **30 s**, keyed by the credential hash (at most 256 entries), and the same error is returned
+  without spawning. After 30 s the next call tries again.
+
+Not bounded: one child can still grow if upstream returns a very large response. The container's
+OOM restart is the backstop.
 
 Known upstream behaviours to be aware of:
 
@@ -123,6 +183,12 @@ threshold, descriptions are cut to the first sentence (max 300 chars) with the
 | `acronis_mark_alert_as_false_positive` | write | Alert Manager 1.0 |
 | `acronis_update_investigation_state` | write | Endpoint Detection and Response API 1.0 |
 | `acronis_execute_protection_policy` | write | Resource and Policy Management API v4 |
+**Before enabling writes (`ACRONIS_ENABLE_WRITES=true`)** two hardening items from the security
+review (WYREAI-711) are still open, and the fleet does not enable writes, so only the 34 reads are
+served: rejecting `.`, `..`, `/` and `%` in path parameters (which parameters are path parameters
+depends on each upstream endpoint, so a blanket string check would break legitimate filters), and a
+cap on the total response size (today each text block is capped at 100 KB, not their sum).
+
 ### Excluded categories
 
 Not exposed and not callable, whatever the environment:
@@ -159,9 +225,12 @@ Copy [`.env.example`](.env.example). Leave `CONDUIT_S2S_SECRET` empty in that fi
 | `X-Acronis-Client-Id` | API client ID |
 | `X-Acronis-Client-Secret` | API client secret |
 
-**Base URL validation (SSRF guard):** https only, hostname must end with `.acronis.com`, no
-userinfo, no non-default port, no path/query/fragment. Anything else is rejected (401 in gateway
-mode, no child spawned).
+**Base URL validation (SSRF guard):** https only, hostname must be **exactly one DNS label under
+`acronis.com`** (`eu8-cloud.acronis.com`; the same rule as Conduit), no userinfo, no non-default
+port, no path/query/fragment. So `acronis.com`, `a.b.acronis.com`, a trailing dot, `evilacronis.com`,
+`acronis.com.evil.com` and IDN/punycode look-alikes are all rejected (401 in gateway mode, no child
+spawned). The URL parser lowercases the host, so `EU8-Cloud.Acronis.com` is the same host and is
+stored lowercase.
 
 ### Environment variables
 
@@ -171,7 +240,7 @@ mode, no child spawned).
 | `ACRONIS_CLIENT_ID` | stdio and `AUTH_MODE=env` | API client ID |
 | `ACRONIS_CLIENT_SECRET` | stdio and `AUTH_MODE=env` | API client secret |
 | `ACRONIS_ENABLE_WRITES` | No | `true` exposes the 3 write tools. Default `false`. |
-| `ACRONIS_POOL_MAX` | No | Max concurrent upstream children (LRU). Default `50`. |
+| `ACRONIS_POOL_MAX` | No | Max concurrent upstream children. Default `3` (fits 0.5 Gi); clamped to a ceiling of `8`. See "Pool sizing". |
 | `ACRONIS_POOL_IDLE_MS` | No | Idle time before a child is closed. Default `600000` (10 min). |
 | `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
 | `AUTH_MODE` | No | `gateway` (Docker image and Compose default) or `env`. `env` uses `ACRONIS_*` only after S2S auth succeeds. |
@@ -224,7 +293,8 @@ MCP_TRANSPORT=http MCP_ALLOW_INSECURE_DEV=1 npm start
 
 The image (`node:26-alpine`, runs as user `acronis`) listens on `0.0.0.0` inside the container and
 defaults to `AUTH_MODE=gateway`. No registry auth or build secret is needed. The container needs
-outbound HTTPS to the Acronis datacenters.
+outbound HTTPS to the Acronis datacenters (see "Egress" for what restricts it). The build fails if
+the installed upstream bundle differs from the pin (`scripts/verify-upstream.mjs`).
 
 ```bash
 docker build --platform linux/amd64 -t acronis-mcp .
@@ -244,11 +314,14 @@ npm install
 npm run lint && npm run typecheck && npm test && npm run build
 npm run smoke        # dual-era HTTP smoke test (after build)
 npm run gen-tools    # regenerate src/generated/tools.ts
+npm run verify-upstream  # check the pinned upstream version, lockfile integrity and bundle sha256
 ```
 
-The integration test spawns the real pinned package. Upstream 1.0.1 needs a token endpoint before it
-answers `tools/list`, so the test points `OAUTH_TOKEN_URL` (and a temp `HOME`) at a local fake while
-keeping `API_BASE_URL=https://example.acronis.com` and dummy credentials.
+The integration tests spawn the real pinned package. Upstream 1.0.1 needs a token endpoint before it
+answers `tools/list`, so the tests point the child's `API_BASE_URL` (and a temp `HOME`) at a local
+fake, with dummy credentials. `http-tenant-isolation.test.ts` goes through the real HTTP server and
+checks, against real child processes, that different credentials get separate children and never
+see each other's credentials.
 
 ## License
 

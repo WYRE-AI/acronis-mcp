@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+Conditions of the security review (WYREAI-711), to clear before the vendor is un-hidden.
+
+- Upstream pool is bounded to the container's memory. Each upstream child is a
+  full Node process (about 116 MiB RSS), so the old default of 50 could not fit
+  the 0.5 Gi container. `ACRONIS_POOL_MAX` now defaults to 3 and is clamped to a
+  hard ceiling of 8. A new credential beyond the cap waits in a bounded queue
+  (8 callers, 30 s) and is then refused with a `rate_limited` error; it never
+  spawns a child.
+- A failed child spawn is remembered for 30 s per credential hash (at most 256
+  entries), so a bad or revoked credential cannot cause a spawn per call.
+- Host check: the Acronis base URL must be exactly one valid DNS label under
+  `acronis.com` (`eu8-cloud.acronis.com`), the same rule as Conduit. Deeper
+  names such as `user-content.files.acronis.com` no longer receive the
+  `client_secret`.
+- Every upstream child preloads `child-egress-guard.cjs`: its `fetch` can reach
+  only the origin of its own `API_BASE_URL` and never follows a redirect, so a
+  307/308 from the token endpoint can no longer replay the `client_secret` to
+  another host.
+- Supply chain: `scripts/upstream-pin.json` pins the upstream version, its
+  lockfile tarball integrity and the sha256 of `dist/bundle.js`.
+  `scripts/verify-upstream.mjs` fails the Docker build and CI on any
+  difference. Dependabot ignores `@acronis-platform/mcp`, and `CODEOWNERS`
+  requires a human owner for the pin, lockfile, Dockerfile and CI.
+
+### Changed
+
+- `ACRONIS_POOL_MAX` default is 3 (was 50), and values above 8 are clamped.
+  Raise it only together with the container memory.
+
 ### Fixed
 
 - Redaction of upstream tool output is now linear-time. The key/value and JWT
@@ -27,5 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HTTP-level tenant isolation test with real child processes: different
+  credentials get separate children, the same credentials reuse one, and one
+  request's credentials never reach another request's child, traffic or
+  response (WYREAI-711).
 - Regression test: a malformed request target such as `//h:99999/` answers
   400 without an unhandled rejection.

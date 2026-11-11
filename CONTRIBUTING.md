@@ -25,6 +25,9 @@ MCP_ALLOW_INSECURE_DEV=1 MCP_TRANSPORT=http npm start
 
 ## Bumping the pinned upstream
 
-`@acronis-platform/mcp` is pinned to an exact version. Bump it by PR only: update `package.json`,
-re-capture `research/upstream-tools-*.json`, run `npm run gen-tools`, review `research/tiers.json`,
-and keep the pinned-version test in sync.
+`@acronis-platform/mcp` is pinned to an exact version, tarball integrity and bundle sha256
+(`scripts/upstream-pin.json`). Bump it by PR only, with a human diff of the new bundle (no bot may
+merge it; Dependabot ignores the package): update `package.json` and the lockfile, re-capture
+`research/upstream-tools-*.json`, run `npm run gen-tools`, review `research/tiers.json`, update
+`scripts/upstream-pin.json`, and keep the pinned-version test in sync. `npm run verify-upstream`
+must pass. See README "Upstream pinning policy".
