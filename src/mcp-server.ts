@@ -70,7 +70,8 @@ export async function handleToolCall(
   deps: ServerDeps,
   credentials: AcronisCredentials | undefined,
   name: unknown,
-  args: unknown
+  args: unknown,
+  signal?: AbortSignal
 ) {
   // Second enforcement layer (the child also gets MCP_TOOLS_INCLUDE).
   const upstreamName = resolveUpstreamName(name, deps.writes);
@@ -88,7 +89,8 @@ export async function handleToolCall(
   const secrets = [credentials.clientSecret, credentials.clientId];
   try {
     const result = await deps.pool.withConnection(credentials, (conn) =>
-      conn.callTool(upstreamName, (args && typeof args === "object" ? args : {}) as Record<string, unknown>)
+      conn.callTool(upstreamName, (args && typeof args === "object" ? args : {}) as Record<string, unknown>),
+      signal
     );
     return sanitizeToolResult(result, secrets);
   } catch (error) {
@@ -109,10 +111,10 @@ export function createMcpServer(deps: ServerDeps, credentials?: AcronisCredentia
 
   server.setRequestHandler("tools/list", async () => listToolsResult(deps.writes));
 
-  server.setRequestHandler("tools/call", async (request) => {
+  server.setRequestHandler("tools/call", async (request, ctx) => {
     const { name, arguments: args } = request.params;
     logger.debug("Tool call received", { tool: name });
-    return handleToolCall(deps, credentials, name, args);
+    return handleToolCall(deps, credentials, name, args, ctx.mcpReq.signal);
   });
 
   return server;
