@@ -13,10 +13,10 @@ GitHub Actions outage, so it was re-triggered by a later commit to `main`.
 ### Changed
 
 - Follow-ups from the final review of the upstream pool (WYREAI-738). Documented that
-  `closeTimeoutMs` frees a slot on a timer, not on confirmed exit, so it must stay above the
+  `closeTimeoutMs` frees a running child's slot on a timer, not on confirmed exit (a starting child keeps its slot until its spawn ends), so it must stay above the
   SDK's close time of about 4 s; documented the latency trade-off of the 8 s replacement timeout
-  in the README; reworded the incumbent-share figures as "about" (strictly 50% with the 2 s
-  `killAndWait` polling). `killAndWait` now treats only `ESRCH` as "already gone" and logs other
+  in the README; reworded the incumbent-share figures as "about" (about 50% with the 2 s
+  `killAndWait` polling, plus untimed setup and cleanup). `killAndWait` now treats only `ESRCH` as "already gone" and logs other
   kill errors. The replacement-victim marker is cleared only by its owner. The test fixture
   `record-child.cjs` writes its record through a temp file and a rename.
 

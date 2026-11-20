@@ -99,8 +99,9 @@ export const MIN_POOL_SLICE_MS = 1_000;
  * escalates (stdin EOF, 2 s, SIGTERM, 2 s, SIGKILL), so this only bounds a close
  * that never returns, so one stuck child cannot hold up every later replacement.
  *
- * Constraint: when this timer fires the slot is freed whether or not the child has
- * exited. The SDK's own close takes up to about 4 s, so the value must stay above that.
+ * Constraint: when this timer fires the slot of a running child is freed whether or not the
+ * child has exited. A child that is still starting keeps its slot until its spawn ends.
+ * The SDK's own close takes up to about 4 s, so the value must stay above that.
  * With a smaller one (it can only be set through the constructor option, not the
  * environment) live children can exceed the pool maximum: a reviewer saw 5 at max 1.
  */
@@ -364,7 +365,8 @@ export interface PoolOptions {
   sliceMs?: number;
   /**
    * How long to wait for a child to finish closing before moving on. Keep it above the SDK's
-   * close time (about 4 s): when it elapses the slot is freed even if the child is still alive.
+   * close time (about 4 s): when it elapses the slot of a running child is freed even if the
+   * child is still alive. A child that is still starting keeps its slot until its spawn ends.
    */
   closeTimeoutMs?: number;
   now?: () => number;
@@ -754,8 +756,8 @@ export class UpstreamPool {
    * from a healthy tenant: it is held for one failed spawn (REPLACEMENT_SPAWN_TIMEOUT_MS,
    * plus up to 2 s for killAndWait to see the child gone) per slice it serves, so it keeps
    * about sliceMs / (sliceMs + REPLACEMENT_SPAWN_TIMEOUT_MS) of its time: about 56% at the
-   * default 10 s slice if every bad spawn runs to its timeout (strictly 50% counting the
-   * killAndWait polling), 87% if each fails after 1.5 s.
+   * default 10 s slice if every bad spawn runs to its timeout (about 50% counting the
+   * killAndWait polling; untimed setup and cleanup add to the held time), 87% if each fails after 1.5 s.
    */
   private create(key: string, creds: AcronisCredentials, victim?: Entry): Entry {
     const entry: Entry = {

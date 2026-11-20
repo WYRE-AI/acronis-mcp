@@ -311,7 +311,7 @@ How the pool behaves at the ceiling:
   another credential may ask it to make way again. So the incumbent, if healthy, is held for one failed
   spawn per slice it serves, and keeps about `slice / (slice + 8 s)` of its time however many bad
   credentials rotate: **about 56% at the default 10 s slice if every bad spawn runs to the 8 s replacement
-  timeout (strictly 50%, counting the up to 2 s the pool polls for the killed child to exit), about 87% if each fails after 1.5 s** (and only 11% with the smallest slice, 1 s, which is one
+  timeout (about 50%, counting the up to 2 s the pool polls for the killed child to exit; untimed setup and cleanup add to the held time), about 87% if each fails after 1.5 s** (and only 11% with the smallest slice, 1 s, which is one
   more reason not to lower it). Reviewer's probe (ceiling 1, slice 10 s, 30 s wait, 1.5 s bad spawns,
   32 distinct bad clientIds in 48 s, a healthy tenant calling twice a second): the reviewer measured
   1 call in 48 s with real children; the same shape on a fake clock, as a test, gave 20 of 96 before
