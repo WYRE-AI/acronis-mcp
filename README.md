@@ -309,9 +309,9 @@ How the pool behaves at the ceiling:
   yield once its slice is over, and the incumbent takes no new calls while the newcomer's spawn is
   tried. When that spawn fails the incumbent **keeps its child and gets a whole new slice** before
   another credential may ask it to make way again. So the incumbent, if healthy, is held for one failed
-  spawn per slice it serves, and keeps at least `slice / (slice + 8 s)` of its time however many bad
-  credentials rotate: **56% at the default 10 s slice if every bad spawn runs to the 8 s replacement
-  timeout, 87% if each fails after 1.5 s** (and only 11% with the smallest slice, 1 s, which is one
+  spawn per slice it serves, and keeps about `slice / (slice + 8 s)` of its time however many bad
+  credentials rotate: **about 56% at the default 10 s slice if every bad spawn runs to the 8 s replacement
+  timeout (strictly 50%, counting the up to 2 s the pool polls for the killed child to exit), about 87% if each fails after 1.5 s** (and only 11% with the smallest slice, 1 s, which is one
   more reason not to lower it). Reviewer's probe (ceiling 1, slice 10 s, 30 s wait, 1.5 s bad spawns,
   32 distinct bad clientIds in 48 s, a healthy tenant calling twice a second): the reviewer measured
   1 call in 48 s with real children; the same shape on a fake clock, as a test, gave 20 of 96 before
@@ -330,6 +330,10 @@ How the pool behaves at the ceiling:
     before it may ask the incumbent to make way: one full slice (10 s by default) per bad credential
     ahead of it, plus its own spawn. The reviewer measured 16.5 s with one bad credential ahead, and
     `rate_limited` with three ahead at the 30 s wait.
+  - *Latency trade-off of the 8 s replacement timeout.* A valid caller that arrives about 11 s into a
+    tarpitted replacement is now served at about 30.1 s (it was about 20.6 s), because the failed
+    replacement gives the incumbent a fresh slice before the next one may start. A later caller may
+    get `rate_limited` in that case. This is the price of not letting a tarpit hold a healthy tenant.
 - A caller that disconnects (the MCP request's abort signal, tested over real HTTP) leaves every
   queue at once and frees its place. This also holds while the child is still starting and just
   before the call would run: a caller that has gone is rejected and its call (possibly a write) never

@@ -98,6 +98,11 @@ export const MIN_POOL_SLICE_MS = 1_000;
  * How long the pool waits for a child to finish closing. The stdio transport already
  * escalates (stdin EOF, 2 s, SIGTERM, 2 s, SIGKILL), so this only bounds a close
  * that never returns, so one stuck child cannot hold up every later replacement.
+ *
+ * Constraint: when this timer fires the slot is freed whether or not the child has
+ * exited. The SDK's own close takes up to about 4 s, so the value must stay above that.
+ * With a smaller one (it can only be set through the constructor option, not the
+ * environment) live children can exceed the pool maximum: a reviewer saw 5 at max 1.
  */
 export const CLOSE_TIMEOUT_MS = 8_000;
 /**
@@ -208,8 +213,11 @@ async function killAndWait(pid: number | null, timeoutMs = 2_000): Promise<void>
   if (pid === null) return;
   try {
     process.kill(pid, "SIGKILL");
-  } catch {
-    return; // already gone
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+      logger.warn("Could not kill upstream child", { pid, error: err instanceof Error ? err.message : String(err) });
+    }
+    return; // ESRCH: already gone
   }
   const alive = () => {
     try {
@@ -354,7 +362,10 @@ export interface PoolOptions {
   failedSpawnTtlMs?: number;
   /** How long a child serves its tenant, while others wait, before it takes no new calls. */
   sliceMs?: number;
-  /** How long to wait for a child to finish closing before moving on. */
+  /**
+   * How long to wait for a child to finish closing before moving on. Keep it above the SDK's
+   * close time (about 4 s): when it elapses the slot is freed even if the child is still alive.
+   */
   closeTimeoutMs?: number;
   now?: () => number;
 }
@@ -740,10 +751,11 @@ export class UpstreamPool {
    * If the spawn fails the victim stays, and gets a whole new slice (sliceEndsAt)
    * before it may be asked to make way again. That bounds what a stream of distinct
    * bad credentials, which the per-credential negative cache does not stop, can take
-   * from a healthy tenant: it is held for one failed spawn (REPLACEMENT_SPAWN_TIMEOUT_MS
-   * at the very most) per slice it serves, so it keeps at least
-   * sliceMs / (sliceMs + REPLACEMENT_SPAWN_TIMEOUT_MS) of its time: 56% at the default
-   * 10 s slice if every bad spawn runs to its timeout, 87% if each fails after 1.5 s.
+   * from a healthy tenant: it is held for one failed spawn (REPLACEMENT_SPAWN_TIMEOUT_MS,
+   * plus up to 2 s for killAndWait to see the child gone) per slice it serves, so it keeps
+   * about sliceMs / (sliceMs + REPLACEMENT_SPAWN_TIMEOUT_MS) of its time: about 56% at the
+   * default 10 s slice if every bad spawn runs to its timeout (strictly 50% counting the
+   * killAndWait polling), 87% if each fails after 1.5 s.
    */
   private create(key: string, creds: AcronisCredentials, victim?: Entry): Entry {
     const entry: Entry = {
@@ -773,7 +785,7 @@ export class UpstreamPool {
       })
       .finally(() => {
         if (!victim) return;
-        this.replacementVictim = undefined; // the newcomer is up (the victim is closing) or failed (the victim stays)
+        if (this.replacementVictim === victim) this.replacementVictim = undefined; // the newcomer is up (the victim is closing) or failed (the victim stays)
         this.wake();
       });
     this.entries.set(key, entry);

@@ -133,7 +133,7 @@ function newPool(extraEnv: Record<string, string> = {}, spawnTimeoutMs?: number)
 }
 
 const records = (): ChildRecord[] =>
-  readdirSync(recordDir).map((f) => JSON.parse(readFileSync(join(recordDir, f), "utf8")) as ChildRecord);
+  readdirSync(recordDir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(join(recordDir, f), "utf8")) as ChildRecord);
 const pidOf = (tenant: AcronisCredentials) => records().find((r) => r.env.OAUTH_CLIENT_ID === tenant.clientId)?.pid as number;
 const call = (pool: UpstreamPool, tenant: AcronisCredentials) =>
   pool.withConnection(tenant, (c) => c.callTool("fetch_all_alerts", {}));
