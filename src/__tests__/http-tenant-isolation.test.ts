@@ -140,7 +140,7 @@ async function callAs(tenant: { id: string; secret: string }): Promise<string> {
 }
 
 const childRecords = (): ChildRecord[] =>
-  readdirSync(recordDir).map((f) => JSON.parse(readFileSync(join(recordDir, f), "utf8")) as ChildRecord);
+  readdirSync(recordDir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(join(recordDir, f), "utf8")) as ChildRecord);
 const childOf = (tenant: { id: string }) => childRecords().filter((c) => c.env.OAUTH_CLIENT_ID === tenant.id);
 
 describe("HTTP tenant isolation (real children)", () => {
