@@ -36,8 +36,8 @@
   "dependencies": {
     "@acronis-platform/mcp": "1.0.1",
     "@modelcontextprotocol/client": "^2.1.0",
-    "@modelcontextprotocol/node": "^2.1.0",
-    "@modelcontextprotocol/server": "^2.0.0-beta.5"
+    "@modelcontextprotocol/node": "^2.1.2",
+    "@modelcontextprotocol/server": "^2.4.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
